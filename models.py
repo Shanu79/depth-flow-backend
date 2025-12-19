@@ -10,6 +10,7 @@ class User(Base):
     full_name = Column(String, nullable=True)
     profile_pic = Column(String, nullable=True)
     provider = Column(String, default="local") # "google" or "local"
+    plan = Column(String, default="free") # User plan: free, pro, etc.
     
     # THE LEDGER
     credits = Column(Integer, default=20) # Give 20 free credits on signup

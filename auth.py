@@ -4,14 +4,25 @@ from jose import jwt, JWTError
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
+from passlib.context import CryptContext 
 from database import get_db
 from models import User
 
 SECRET_KEY = os.getenv("APP_SECRET_KEY", "change_this_secret_in_prod")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 Days
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
+# --- PASSWORD HASHING SETUP ---
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login") # Pointing to our new login route
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+# ------------------------------
 
 def create_access_token(data: dict):
     to_encode = data.copy()

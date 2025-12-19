@@ -34,7 +34,7 @@ if not DODO_API_KEY or not WEBHOOK_SECRET:
 
 client = DodoPayments(
     bearer_token=DODO_API_KEY,
-    environment="test_mode" # Change to "live_mode" when ready
+    environment="live_mode" # Change to "live_mode" when ready
 )
 
 # Centralized configuration for Plans & Credits

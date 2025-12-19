@@ -12,4 +12,4 @@ class User(Base):
     provider = Column(String, default="local") # "google" or "local"
     
     # THE LEDGER
-    credits = Column(Integer, default=50) # Give 50 free credits on signup
+    credits = Column(Integer, default=20) # Give 20 free credits on signup

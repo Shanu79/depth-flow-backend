@@ -1,0 +1,16 @@
+# Security: Never commit your secrets
+.env
+
+# Database: Don't commit local data
+*.db
+*.sqlite
+depthflow.db
+users.db
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Virtual Environment
+venv/
+env/

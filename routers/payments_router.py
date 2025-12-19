@@ -26,6 +26,9 @@ router = APIRouter(
 DODO_API_KEY = os.environ.get("DODO_PAYMENTS_API_KEY")  # Use test key for development
 WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET")
 
+#frontend URL
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
 if not DODO_API_KEY or not WEBHOOK_SECRET:
     logger.warning("CRITICAL: Dodo API Key or Webhook Secret is missing!")
 
@@ -91,7 +94,7 @@ async def create_checkout_session(
                 "credits_to_add": str(credits_to_add),
                 "plan_name": request.plan_name
             },
-            return_url="http://localhost:3000/workspace", 
+            return_url=f"{FRONTEND_URL}/workspace", 
         )
         
         return {"checkout_url": session.checkout_url}

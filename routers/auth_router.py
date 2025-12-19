@@ -30,6 +30,9 @@ CALLBACK_URL = os.getenv("GOOGLE_REDIRECT_URI")
 
 google_sso = GoogleSSO(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, CALLBACK_URL)
 
+# frontend URL
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
 
 # ==========================================
 # 1. EMAIL/PASSWORD REGISTRATION
@@ -153,7 +156,7 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
             
         access_token = create_access_token(data={"sub": db_user.email})
         
-        frontend_url = f"http://localhost:3000/auth-success?token={access_token}"
+        frontend_url = f"{FRONTEND_URL}/auth-success?token={access_token}"
         return RedirectResponse(url=frontend_url)
         
     except Exception as e:

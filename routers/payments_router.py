@@ -23,7 +23,7 @@ router = APIRouter(
 
 # --- 2. CONFIGURATION ---
 # Load secrets securely from environment
-DODO_API_KEY = os.environ.get("DODO_PAYMENTS_API_KEY_TEST")  # Use test key for development
+DODO_API_KEY = os.environ.get("DODO_PAYMENTS_API_KEY")  # Use test key for development
 WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET")
 
 if not DODO_API_KEY or not WEBHOOK_SECRET:

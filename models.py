@@ -14,3 +14,4 @@ class User(Base):
     
     # THE LEDGER
     credits = Column(Integer, default=20) # Give 20 free credits on signup
+    last_login_ip = Column(String, nullable=True)

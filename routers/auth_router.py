@@ -71,20 +71,26 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     access_token = create_access_token(data={"sub": new_user.email})
     return {"access_token": access_token, "token_type": "bearer"}
 
+def get_client_ip(request: Request):
+    # Check if behind a proxy (like Nginx/Cloudflare)
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0]
+    return request.client.host
 
 # ==========================================
 # 2. EMAIL/PASSWORD LOGIN
 # ==========================================
 @router.post("/login")
-def login(login_data: UserLogin, db: Session = Depends(get_db)):
+def login(
+    request: Request,
+    login_data: UserLogin, 
+    db: Session = Depends(get_db)
+):
     # A. Find User
     user = db.query(User).filter(User.email == login_data.email).first()
     
     # B. Verify Password
-    # We check:
-    # 1. If user exists
-    # 2. If user has a password (they might be a Google-only user)
-    # 3. If password matches hash
     if not user or not user.hashed_password or not verify_password(login_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -92,9 +98,26 @@ def login(login_data: UserLogin, db: Session = Depends(get_db)):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # --- NEW CODE: Capture & Save IP ---
+    try:
+        user_ip = get_client_ip(request) # Get the IP
+        user.last_login_ip = user_ip     # Update the user model
+        db.commit()                      # Save to SQLite
+        db.refresh(user)                 # Refresh instance (optional)
+    except Exception as e:
+        # Don't fail login just because IP tracking failed
+        print(f"Failed to save IP: {e}") 
+    # -----------------------------------
+
     # C. Generate Token
     access_token = create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+    
+    # Optional: You can return the detected IP to debug on frontend
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "ip_detected": user.last_login_ip 
+    }
 
 
 # ==========================================
@@ -121,7 +144,7 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
                 full_name=google_user.display_name,
                 profile_pic=google_user.picture,
                 provider="google",
-                credits=50,
+                credits=20,
                 plan="free"
             )
             db.add(db_user)

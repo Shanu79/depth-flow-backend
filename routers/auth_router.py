@@ -50,30 +50,28 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     # B. Hash the password
     hashed_pw = get_password_hash(user_data.password)
 
-    # C. Calculate Credits based on Plan (Optional)
-    initial_credits = 20  # Default free credits
-    if user_data.plan.lower() == "pro":
-        initial_credits = 1000
-    elif user_data.plan.lower() == "premium":
-        initial_credits = 5000
-
-    # D. Create the User in DB
+    # C. Create User (FORCE FREE PLAN)
+    # We ignore 'user_data.plan' completely for security.
     new_user = User(
         email=user_data.email,
         hashed_password=hashed_pw,
         full_name=user_data.full_name,
-        provider="local",         # Mark as local user
-        plan=user_data.plan,
-        credits=initial_credits
+        provider="local",
+        
+        # --- ENFORCE DEFAULTS ---
+        plan="Free",              # Always start as Free
+        credits=20,               # Give starter credits (e.g. 5)
+        billing_cycle="monthly",  # Default to monthly
+        subscription_status="active" # Free plan is always active
     )
+    
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
-    # E. Auto-Login (Return Token)
+    # D. Auto-Login
     access_token = create_access_token(data={"sub": new_user.email})
     return {"access_token": access_token, "token_type": "bearer"}
-
 def get_client_ip(request: Request):
     # Check if behind a proxy (like Nginx/Cloudflare)
     forwarded = request.headers.get("X-Forwarded-For")
@@ -141,14 +139,18 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
         db_user = db.query(User).filter(User.email == google_user.email).first()
         
         if not db_user:
-            # Create Google User (No Password)
+            # --- CREATE NEW GOOGLE USER ---
             db_user = User(
                 email=google_user.email,
                 full_name=google_user.display_name,
                 profile_pic=google_user.picture,
                 provider="google",
+                
+                # --- ENFORCE DEFAULTS ---
+                plan="Free",
                 credits=20,
-                plan="free"
+                subscription_status="active",
+                billing_cycle="monthly"
             )
             db.add(db_user)
             db.commit()
@@ -156,12 +158,12 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
             
         access_token = create_access_token(data={"sub": db_user.email})
         
+        # Ensure you imported FRONTEND_URL from your .env config at the top
         frontend_url = f"{FRONTEND_URL}/auth-success?token={access_token}"
         return RedirectResponse(url=frontend_url)
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 # ==========================================
 # 4. UTILITIES
 # ==========================================

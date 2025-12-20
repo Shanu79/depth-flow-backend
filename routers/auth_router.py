@@ -134,7 +134,10 @@ async def google_login():
 async def google_callback(request: Request, db: Session = Depends(get_db)):
     try:
         async with google_sso:
-            google_user = await google_sso.verify_and_process(request)
+            google_user = await google_sso.verify_and_process(
+                request, 
+                redirect_uri=CALLBACK_URL
+            )
         
         db_user = db.query(User).filter(User.email == google_user.email).first()
         

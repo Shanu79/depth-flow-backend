@@ -20,3 +20,19 @@ class UserResponse(BaseModel):
     email: str
     credits: int
     plan: str
+    
+class UserResponse(BaseModel):
+    id: int                # Added ID (useful for React keys)
+    email: str
+    full_name: Optional[str] = None
+    credits: int
+    plan: str
+    profile_pic: Optional[str] = None
+    
+    # Critical for Admin Panel
+    is_admin: bool = False 
+    subscription_status: Optional[str] = "inactive"
+
+    # Critical for SQLAlchemy
+    class Config:
+        orm_mode = True

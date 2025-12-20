@@ -22,5 +22,6 @@ class User(Base):
     subscription_end_date = Column(DateTime, nullable=True) # When does the plan expire?
     
     # THE LEDGER
-    credits = Column(Integer, default=5) # Default to 5 or 20
+    credits = Column(Integer, default=20)
     last_login_ip = Column(String, nullable=True)
+    is_admin = Column(Boolean, default=False)

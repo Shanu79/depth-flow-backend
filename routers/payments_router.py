@@ -41,12 +41,12 @@ client = DodoPayments(
 # Update these IDs with your actual Dashboard IDs
 PLAN_CONFIG = {
     "monthly": {
-        "Basic": {"id": "pdt_0NUQxXnGKlkhrpGBAFMvy", "credits": 600},
+        "Basic": {"id": "pdt_0NUQxXnGKlkhrpGBAFMvy", "credits": 550},
         "Pro":   {"id": "pdt_0NUQxXJa0TR6vJJznsrt2", "credits": 1200},
         "Free":  {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 0},
     },
     "yearly": {
-        "Basic": {"id": "pdt_0NUQxWNFaRWTd8eoNkqoJ", "credits": 7200}, # Example: 12 * 600
+        "Basic": {"id": "pdt_0NUQxWNFaRWTd8eoNkqoJ", "credits": 6600}, # Example: 12 * 600
         "Pro":   {"id": "pdt_0NUQxVyW088PIAwIzObuC", "credits": 14400},
         "Free":  {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 0},
     }

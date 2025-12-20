@@ -8,7 +8,7 @@ from models import User
 from schemas import UserResponse # <--- Ensures we don't send passwords back
 from auth import get_current_user # Reuse your existing login logic
 
-router = APIRouter(prefix="/api/admin", tags=["Admin Dashboard"])
+router = APIRouter(prefix="/admin", tags=["Admin Dashboard"])
 
 # --- SECURITY DEPENDENCY ---
 # This function runs before every admin request.

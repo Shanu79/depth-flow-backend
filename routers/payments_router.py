@@ -92,7 +92,8 @@ async def create_checkout_session(
             metadata={
                 "user_id": str(current_user.id),
                 "credits_to_add": str(credits_to_add),
-                "plan_name": request.plan_name
+                "plan_name": request.plan_name,
+                "billing_cycle": request.billing_cycle
             },
             return_url=f"{FRONTEND_URL}/workspace", 
         )
@@ -136,12 +137,21 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         if event_type == "payment.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
+            plan_name = metadata.get("plan_name")
+            billing_cycle = metadata.get("billing_cycle")
+            subscription_id = data.get("subscription_id")
             credits = int(metadata.get("credits_to_add", 0))
 
             if user_id and credits > 0:
                 user = db.query(User).filter(User.id == int(user_id)).first()
                 if user:
                     user.credits += credits
+                    if plan_name:
+                        user.plan = plan_name
+                        user.subscription_status = "active"
+                        user.billing_cycle = billing_cycle
+                    if subscription_id:
+                        user.subscription_id = subscription_id
                     db.commit()
                     logger.info(f"SUCCESS: User {user.email} credited +{credits}")
 

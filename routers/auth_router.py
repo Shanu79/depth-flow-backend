@@ -184,5 +184,6 @@ def read_users_me(current_user: User = Depends(get_current_user)):
         "profile_pic": current_user.profile_pic,
         "plan": current_user.plan,
         "is_admin": current_user.is_admin,
-        "subscription_status": current_user.subscription_status
+        "subscription_status": current_user.subscription_status,
+        "billing_cycle": current_user.billing_cycle
     }

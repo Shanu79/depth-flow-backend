@@ -56,61 +56,72 @@ def save_video_direct(input_url, output_path):
 
 def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png"):
     """
-    Final Optimization:
-    1. Downscales video to 720p (Prevents Memory Crash).
-    2. Centers watermark.
-    3. Silences logs (Prevents Buffer Crash).
+    Memory-Safe Version: Streams video to disk to prevent Server Crash (OOM).
     """
     temp_input = f"temp_{uuid.uuid4()}.mp4"
 
     try:
-        # 1. STREAM DOWNLOAD (Memory Safe)
+        # 1. STREAM DOWNLOAD (Fixes 'Exit Code 128' / OOM Crash)
+        # We use stream=True and shutil.copyfileobj to avoid loading file into RAM
         with requests.get(input_url, stream=True) as r:
             r.raise_for_status()
             with open(temp_input, 'wb') as f:
                 shutil.copyfileobj(r.raw, f)
 
-        # 2. CHECK FFMPEG & WATERMARK
+        # 2. GET FFMPEG PATH
         try:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         except:
-            # Fallback
+            print("⚠️ FFmpeg binary not found. Saving original.")
             os.rename(temp_input, output_path)
             return
 
+        # 3. CHECK WATERMARK
         if not os.path.exists(watermark_path):
+            print(f"⚠️ Watermark missing at {watermark_path}. Saving original.")
             os.rename(temp_input, output_path)
             return
 
-        # 3. RUN FFMPEG (DOWNSCALED 720P)
-        # 'scale=-2:720' forces height to 720p, maintaining aspect ratio.
-        # This drastically reduces RAM usage.
+        # 4. RUN FFMPEG
+        # We add '-y' to force overwrite and '-preset ultrafast' for speed
         command = [
             ffmpeg_exe, '-y',
-            '-hide_banner', '-loglevel', 'error', 
-            '-i', temp_input,
+            '-i', temp_input, 
             '-i', watermark_path,
-            '-filter_complex', '[0:v]scale=-2:720[bg];[bg][1:v]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2',
+            '-filter_complex', 'overlay=main_w-overlay_w-10:main_h-overlay_h-10',
             '-c:v', 'libx264', '-preset', 'ultrafast',
             '-c:a', 'copy',
             output_path
         ]
-        
-        # DISCARD LOGS (Fixes Exit Code 128 buffer overflow)
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-        # Cleanup
+        # Run FFmpeg (Capture output so it doesn't leak to logs unless error)
+        subprocess.run(command, check=True, capture_output=True)
+
+        # Cleanup temp file
         if os.path.exists(temp_input):
             os.remove(temp_input)
 
     except Exception as e:
-        print(f"⚠️ Limit Reached: {e}")
-        # FAIL-SAFE: If it STILL crashes, just save the original immediately.
+        print(f"⚠️ Video Processing Failed: {str(e)}")
+        # CRITICAL FALLBACK: Ensure user still gets a video even if processing fails
+
+
+
+
+
         if os.path.exists(temp_input):
-            if os.path.exists(output_path): os.remove(output_path)
+            # Move the downloaded temp file to the final output path
+            if os.path.exists(output_path):
+                os.remove(output_path)
             os.rename(temp_input, output_path)
         else:
-            save_video_direct(input_url, output_path)
+            # If download failed entirely, try one last direct stream to output
+            try:
+                with requests.get(input_url, stream=True) as r:
+                    with open(output_path, 'wb') as f:
+                        shutil.copyfileobj(r.raw, f)
+            except:
+                print("❌ Fatal: Could not save video.")
 
 def cleanup_old_files(folder="static", age_limit=1800): 
     """Deletes files older than 30 mins."""

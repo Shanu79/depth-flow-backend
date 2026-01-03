@@ -10,6 +10,7 @@ from database import get_db
 from models import User
 from auth import get_current_user
 import shutil
+import gc
 
 router = APIRouter(prefix="/ai", tags=["AI Generation"])
 
@@ -56,19 +57,22 @@ def save_video_direct(input_url, output_path):
 
 def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png"):
     """
-    Memory-Safe Version: Streams video to disk to prevent Server Crash (OOM).
+    Low-RAM Optimized Version: Uses single-thread processing to prevent OOM (Exit 128).
     """
     temp_input = f"temp_{uuid.uuid4()}.mp4"
 
     try:
-        # 1. STREAM DOWNLOAD (Fixes 'Exit Code 128' / OOM Crash)
-        # We use stream=True and shutil.copyfileobj to avoid loading file into RAM
+        # 1. STREAM DOWNLOAD TO DISK (Keep RAM clean)
         with requests.get(input_url, stream=True) as r:
             r.raise_for_status()
             with open(temp_input, 'wb') as f:
                 shutil.copyfileobj(r.raw, f)
 
-        # 2. GET FFMPEG PATH
+        # 2. FORCE GARBAGE COLLECTION
+        # Clear any request buffers before starting heavy FFmpeg process
+        gc.collect()
+
+        # 3. GET FFMPEG PATH
         try:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         except:
@@ -76,52 +80,47 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
             os.rename(temp_input, output_path)
             return
 
-        # 3. CHECK WATERMARK
         if not os.path.exists(watermark_path):
-            print(f"⚠️ Watermark missing at {watermark_path}. Saving original.")
+            print(f"⚠️ Watermark missing. Saving original.")
             os.rename(temp_input, output_path)
             return
 
-        # 4. RUN FFMPEG
-        # We add '-y' to force overwrite and '-preset ultrafast' for speed
+        # 4. RUN FFMPEG (LOW MEMORY MODE)
+        # -threads 1: Crucial for 512MB RAM. Prevents spawning multiple memory-hungry threads.
+        # -max_muxing_queue_size 1024: Prevents buffer bloat.
         command = [
             ffmpeg_exe, '-y',
             '-i', temp_input, 
             '-i', watermark_path,
             '-filter_complex', 'overlay=main_w-overlay_w-10:main_h-overlay_h-10',
-            '-c:v', 'libx264', '-preset', 'ultrafast',
+            '-c:v', 'libx264', 
+            '-preset', 'ultrafast',  
+            '-threads', '1',         
             '-c:a', 'copy',
+            '-max_muxing_queue_size', '1024', # Prevent buffer overflow
             output_path
         ]
 
-        # Run FFmpeg (Capture output so it doesn't leak to logs unless error)
         subprocess.run(command, check=True, capture_output=True)
 
-        # Cleanup temp file
         if os.path.exists(temp_input):
             os.remove(temp_input)
 
     except Exception as e:
         print(f"⚠️ Video Processing Failed: {str(e)}")
-        # CRITICAL FALLBACK: Ensure user still gets a video even if processing fails
-
-
-
-
-
+        # Fallback: Deliver non-watermarked video rather than crashing
         if os.path.exists(temp_input):
-            # Move the downloaded temp file to the final output path
             if os.path.exists(output_path):
                 os.remove(output_path)
             os.rename(temp_input, output_path)
         else:
-            # If download failed entirely, try one last direct stream to output
+            # Last resort stream copy
             try:
                 with requests.get(input_url, stream=True) as r:
                     with open(output_path, 'wb') as f:
                         shutil.copyfileobj(r.raw, f)
             except:
-                print("❌ Fatal: Could not save video.")
+                pass
 
 def cleanup_old_files(folder="static", age_limit=1800): 
     """Deletes files older than 30 mins."""

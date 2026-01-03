@@ -40,15 +40,31 @@ def get_upload_url(token, filename, content_type):
     response.raise_for_status()
     return response.json()
 
+def save_video_direct(input_url, output_path):
+    """
+    For PAID users: Downloads the video directly without watermarking.
+    Uses memory-safe streaming to prevent crashes.
+    """
+    try:
+        with requests.get(input_url, stream=True) as r:
+            r.raise_for_status()
+            with open(output_path, 'wb') as f:
+                shutil.copyfileobj(r.raw, f)
+    except Exception as e:
+        print(f"❌ Failed to download video: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save video file.")
+
 def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png"):
     """
-    Memory-Safe Version: Streams video to disk to prevent Server Crash (OOM).
+    For FREE users: Streams video -> Adds transparent, centered watermark -> Saves to disk.
     """
     temp_input = f"temp_{uuid.uuid4()}.mp4"
+    
+    # SET OPACITY HERE (0.1 = faint, 1.0 = solid)
+    opacity_level = "0.3" 
 
     try:
-        # 1. STREAM DOWNLOAD (Fixes 'Exit Code 128' / OOM Crash)
-        # We use stream=True and shutil.copyfileobj to avoid loading file into RAM
+        # 1. STREAM DOWNLOAD (Memory Safe)
         with requests.get(input_url, stream=True) as r:
             r.raise_for_status()
             with open(temp_input, 'wb') as f:
@@ -62,47 +78,35 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
             os.rename(temp_input, output_path)
             return
 
-        # 3. CHECK WATERMARK
-        if not os.path.exists(watermark_path):
-            print(f"⚠️ Watermark missing at {watermark_path}. Saving original.")
-            os.rename(temp_input, output_path)
-            return
-
-        # 4. RUN FFMPEG
-        # We add '-y' to force overwrite and '-preset ultrafast' for speed
+        # 4. RUN FFMPEG (UPDATED FOR TRANSPARENCY & CENTERING)
+        # Explanation of filter_complex:
+        # [1:v]colorchannelmixer=aa=0.4[trans] -> Take input 1 (watermark), set alpha to 0.4, name result [trans]
+        # [0:v][trans]overlay=(main_w...)/2:(main_h...)/2 -> Take input 0 (video), overlay [trans] on top at center coordinates.
         command = [
             ffmpeg_exe, '-y',
-            '-i', temp_input, 
-            '-i', watermark_path,
-            '-filter_complex', 'overlay=main_w-overlay_w-10:main_h-overlay_h-10',
+            '-i', temp_input,      # Input [0:v]
+            '-i', watermark_path,  # Input [1:v]
+            '-filter_complex', 
+            f'[1:v]colorchannelmixer=aa={opacity_level}[trans];[0:v][trans]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2',
             '-c:v', 'libx264', '-preset', 'ultrafast',
             '-c:a', 'copy',
             output_path
         ]
         
-        # Run FFmpeg (Capture output so it doesn't leak to logs unless error)
         subprocess.run(command, check=True, capture_output=True)
 
-        # Cleanup temp file
+        # Cleanup
         if os.path.exists(temp_input):
             os.remove(temp_input)
 
     except Exception as e:
+        # (Fallback logic remains the same)
         print(f"⚠️ Video Processing Failed: {str(e)}")
-        # CRITICAL FALLBACK: Ensure user still gets a video even if processing fails
         if os.path.exists(temp_input):
-            # Move the downloaded temp file to the final output path
-            if os.path.exists(output_path):
-                os.remove(output_path)
+            if os.path.exists(output_path): os.remove(output_path)
             os.rename(temp_input, output_path)
         else:
-            # If download failed entirely, try one last direct stream to output
-            try:
-                with requests.get(input_url, stream=True) as r:
-                    with open(output_path, 'wb') as f:
-                        shutil.copyfileobj(r.raw, f)
-            except:
-                print("❌ Fatal: Could not save video.")
+            save_video_direct(input_url, output_path)
 
 def cleanup_old_files(folder="static", age_limit=1800): 
     """Deletes files older than 30 mins."""
@@ -196,24 +200,34 @@ async def generate_3d(
 
         immersity_video_url = response.json().get('resultPresignedUrl')
 
-        # 5. WATERMARK & SAVE
-        filename = f"{correlation_id}_branded.mp4"
-        output_path = f"static/{filename}"
+        # --- 5. WATERMARK LOGIC (UPDATED) ---
         
-        apply_watermark(immersity_video_url, output_path)
+        # Check User Plan
+        is_free_user = current_user.plan.lower() == "free"
+
+        if is_free_user:
+            filename = f"{correlation_id}_branded.mp4"
+            output_path = f"static/{filename}"
+            # Apply Watermark (Heavy Processing)
+            apply_watermark(immersity_video_url, output_path)
+        else:
+            filename = f"{correlation_id}_clean.mp4"
+            output_path = f"static/{filename}"
+            # Direct Download (Light Processing)
+            save_video_direct(immersity_video_url, output_path)
 
         # 6. CLEANUP & RETURN
         background_tasks.add_task(cleanup_old_files)
         current_user.credits -= COST_PER_GENERATION
         db.commit()
 
-        # USE THE ENV VAR FOR THE URL
         base_url = os.getenv("BASE_URL", "http://localhost:8000")
         final_url = f"{base_url}/static/{filename}"
 
         return {
             "status": "success", 
             "video_url": final_url,
+            "plan": current_user.plan, # Helpful for frontend to show "Upgrade" badge
             "remaining_credits": current_user.credits
         }
 

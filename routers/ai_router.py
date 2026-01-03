@@ -153,10 +153,12 @@ async def generate_3d(
         elif style == "Horizontal":
             # Pan left/right only
             params["amplitudeX"] = intensity
+            
+        animation_correlation_id = str(uuid.uuid4())
 
         # --- 4. GENERATE ANIMATION ---
         anim_payload = {
-            "correlationId": correlation_id,
+            "correlationId": animation_correlation_id,
             "inputImageUrl": input_image_url,
             "inputDisparityUrl": input_disparity_url, # <--- CRITICAL FIX
             "animationLength": float(speed),          # 1 (Fast) to 10 (Slow)

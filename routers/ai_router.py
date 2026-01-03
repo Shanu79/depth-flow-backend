@@ -3,12 +3,12 @@ import uuid
 import time
 import requests
 import subprocess
+import imageio_ffmpeg
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User
 from auth import get_current_user
-import imageio_ffmpeg
 
 router = APIRouter(prefix="/ai", tags=["AI Generation"])
 
@@ -41,49 +41,62 @@ def get_upload_url(token, filename, content_type):
 
 def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png"):
     """
-    Overlays watermark using the python-embedded FFmpeg binary.
+    Downloads video first, then overlays watermark using python-embedded FFmpeg.
     """
-    try:
-        # 1. GET FFMPEG PATH (From the python library)
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception as e:
-        print(f"⚠️ Could not find FFmpeg binary: {e}. Skipping watermark.")
-        # Fallback: Download original
-        r = requests.get(input_url)
-        with open(output_path, 'wb') as f:
-            f.write(r.content)
-        return
-    
-    # 2. CHECK IF WATERMARK FILE EXISTS
-    if not os.path.exists(watermark_path):
-        print(f"⚠️ Watermark file not found at {watermark_path}. Skipping.")
-        r = requests.get(input_url)
-        with open(output_path, 'wb') as f:
-            f.write(r.content)
-        return
+    temp_input = f"temp_{uuid.uuid4()}.mp4"
 
-    # 3. RUN FFMPEG
-    command = [
-        ffmpeg_exe, '-y',
-        '-i', input_url,
-        '-i', watermark_path,
-        '-filter_complex', 'overlay=main_w-overlay_w-10:main_h-overlay_h-10', # Bottom-Right
-        '-c:v', 'libx264', '-preset', 'ultrafast',
-        '-c:a', 'copy',
-        output_path
-    ]
-    
     try:
-        subprocess.run(command, check=True, capture_output=True)
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg Error: {e.stderr.decode()}")
-        # Fallback: Save original if processing fails
+        # 1. DOWNLOAD VIDEO FIRST (Fixes FFmpeg network errors)
         r = requests.get(input_url)
-        with open(output_path, 'wb') as f:
+        with open(temp_input, 'wb') as f:
             f.write(r.content)
+
+        # 2. GET FFMPEG PATH
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        # 3. CHECK WATERMARK
+        if not os.path.exists(watermark_path):
+            print(f"⚠️ Watermark missing. Saving original.")
+            os.rename(temp_input, output_path)
+            return
+
+        # 4. RUN FFMPEG (Local file -> Local file)
+        command = [
+            ffmpeg_exe, '-y',
+            '-i', temp_input,      # Input is now local file
+            '-i', watermark_path,
+            '-filter_complex', 'overlay=main_w-overlay_w-10:main_h-overlay_h-10',
+            '-c:v', 'libx264', '-preset', 'ultrafast',
+            '-c:a', 'copy',
+            output_path
+        ]
+        
+        subprocess.run(command, check=True, capture_output=True)
+        
+        # Clean up temp file
+        if os.path.exists(temp_input):
+            os.remove(temp_input)
+
+    except Exception as e:
+        # If it was a subprocess error, print stderr for debugging
+        if isinstance(e, subprocess.CalledProcessError):
+            print(f"FFmpeg Error Details: {e.stderr.decode()}")
+        else:
+            print(f"Processing Error: {str(e)}")
+            
+        # FALLBACK: Just save the downloaded file as output
+        if os.path.exists(temp_input):
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            os.rename(temp_input, output_path)
+        else:
+            # If download failed, try streaming direct to output (last resort)
+            r = requests.get(input_url)
+            with open(output_path, 'wb') as f:
+                f.write(r.content)
 
 def cleanup_old_files(folder="static", age_limit=1800): 
-    """Deletes files older than 30 mins to save space."""
+    """Deletes files older than 30 mins."""
     now = time.time()
     if not os.path.exists(folder):
         return
@@ -91,17 +104,17 @@ def cleanup_old_files(folder="static", age_limit=1800):
         file_path = os.path.join(folder, filename)
         if os.path.isfile(file_path):
             if os.stat(file_path).st_mtime < (now - age_limit):
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
+                try: os.remove(file_path)
+                except: pass
+
+# --- ROUTES ---
 
 @router.post("/generate-3d")
 async def generate_3d(
     file: UploadFile = File(...),
-    style: str = Form("Dolly"), # Options: "Dolly", "Orbit", "Zoom", "Horizontal"
-    depth: int = Form(5),       # 1-10
-    speed: int = Form(5),       # 1-10 (Controls animationLength)
+    style: str = Form("Dolly"),
+    depth: int = Form(5),
+    speed: int = Form(5),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -110,7 +123,7 @@ async def generate_3d(
         raise HTTPException(status_code=402, detail="❌ Not enough credits.")
 
     try:
-        # --- 1. UPLOAD IMAGE ---
+        # 1. UPLOAD IMAGE
         token = get_immersity_token()
         upload_info = get_upload_url(token, file.filename, file.content_type)
         
@@ -121,15 +134,9 @@ async def generate_3d(
         input_image_url = upload_info['url']
         correlation_id = str(uuid.uuid4())
 
-        # --- 2. GENERATE DISPARITY MAP (Required) ---
-        # The animation endpoint will FAIL without this
-        disparity_payload = {
-            "correlationId": correlation_id,
-            "inputImageUrl": input_image_url
-        }
+        # 2. GENERATE DISPARITY MAP
+        disparity_payload = { "correlationId": correlation_id, "inputImageUrl": input_image_url }
         
-        # Note: Disparity generation is usually fast, but for production, 
-        # you might want to add a small retry/wait logic here if it takes time.
         disp_response = requests.post(
             f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/disparity',
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -138,48 +145,31 @@ async def generate_3d(
         disp_response.raise_for_status()
         input_disparity_url = disp_response.json().get('resultPresignedUrl')
 
-        # --- 3. CONFIGURE PHYSICS (The "Style" Logic) ---
-        # We translate the user's "Style" choice into raw physics parameters.
-        # Amplitude (0-10): How FAR it moves.
-        # Phase (0-1): The timing offset (0.25 offset = Circular motion).
-        
-        # Base intensity derived from user's 'depth' slider
-        intensity = float(depth)  
-        
-        # Default: No motion
-        params = {
-            "amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0,
-            "phaseX": 0,     "phaseY": 0,     "phaseZ": 0
-        }
+        # 3. CONFIGURE PHYSICS
+        intensity = float(depth)
+        params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
 
         if style == "Orbit":
-            # Circular motion: Move X and Y, but offset Y's timing by 0.25 (90 degrees)
             params["amplitudeX"] = intensity
-            params["amplitudeY"] = intensity * 0.5  # Slight vertical for oval shape
-            params["phaseY"] = 0.25                 # Creates the "Circle" effect
-            
+            params["amplitudeY"] = intensity * 0.5
+            params["phaseY"] = 0.25
         elif style == "Dolly":
-            # Move primarily on Z axis (Forward/Back)
             params["amplitudeZ"] = intensity
-            params["amplitudeX"] = intensity * 0.1  # Tiny X movement adds realism
-            
+            params["amplitudeX"] = intensity * 0.1
         elif style == "Zoom":
-            # Aggressive Z-axis movement
             params["amplitudeZ"] = intensity * 1.2
-            
         elif style == "Horizontal":
-            # Pan left/right only
             params["amplitudeX"] = intensity
             
         animation_correlation_id = str(uuid.uuid4())
 
-        # --- 4. GENERATE ANIMATION ---
+        # 4. GENERATE ANIMATION
         anim_payload = {
             "correlationId": animation_correlation_id,
             "inputImageUrl": input_image_url,
-            "inputDisparityUrl": input_disparity_url, # <--- CRITICAL FIX
-            "animationLength": float(speed),          # 1 (Fast) to 10 (Slow)
-            **params                                  # Unpack our calculated physics
+            "inputDisparityUrl": input_disparity_url,
+            "animationLength": float(speed),
+            **params
         }
 
         response = requests.post(
@@ -197,34 +187,27 @@ async def generate_3d(
 
         immersity_video_url = response.json().get('resultPresignedUrl')
 
-        # --- 5. WATERMARK & SAVE ---
+        # 5. WATERMARK & SAVE
         filename = f"{correlation_id}_branded.mp4"
         output_path = f"static/{filename}"
         
-        # Apply the watermark (using the function we wrote earlier)
         apply_watermark(immersity_video_url, output_path)
 
-        # --- 6. CLEANUP & RESPONSE ---
+        # 6. CLEANUP & RETURN
         background_tasks.add_task(cleanup_old_files)
-        
         current_user.credits -= COST_PER_GENERATION
         db.commit()
 
+        # USE THE ENV VAR FOR THE URL
         base_url = os.getenv("BASE_URL", "http://localhost:8000")
         final_url = f"{base_url}/static/{filename}"
 
         return {
             "status": "success", 
             "video_url": final_url,
-            "original_immersity_url": immersity_video_url, # Helpful for debugging
             "remaining_credits": current_user.credits
         }
 
-    except requests.exceptions.HTTPError as e:
-         # Handle specific API errors (like 400 Bad Request from Immersity)
-         print(f"Upstream API Error: {e.response.text}")
-         raise HTTPException(status_code=502, detail="AI Generation Failed")
-         
     except Exception as e:
         print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

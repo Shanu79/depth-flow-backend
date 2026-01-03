@@ -16,7 +16,8 @@ load_dotenv()
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
-
+if not os.path.exists("static"):
+    os.makedirs("static")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(

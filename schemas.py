@@ -1,6 +1,6 @@
 # schemas.py
 from typing import Optional
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ConfigDict
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -17,13 +17,8 @@ class Token(BaseModel):
     token_type: str
 
 class UserResponse(BaseModel):
-    email: str
-    credits: int
-    plan: str
-    
-class UserResponse(BaseModel):
-    id: int                # Added ID (useful for React keys)
-    email: str
+    id: int               # Critical for React keys
+    email: EmailStr       # Good practice to use EmailStr here too
     full_name: Optional[str] = None
     credits: int
     plan: str
@@ -33,6 +28,5 @@ class UserResponse(BaseModel):
     is_admin: bool = False 
     subscription_status: Optional[str] = "inactive"
 
-    # Critical for SQLAlchemy
-    class Config:
-        orm_mode = True
+    # Pydantic V2 Configuration
+    model_config = ConfigDict(from_attributes=True)

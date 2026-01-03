@@ -109,16 +109,15 @@ async def create_checkout_session(
 async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
     """
     Secure Webhook Handler.
-    Verifies signature and updates user credits.
+    Verifies signature and updates user credits (Handles Initial + Renewals).
     """
     try:
         # 1. Get Raw Body & Headers for Verification
         payload_bytes = await request.body()
         payload_str = payload_bytes.decode("utf-8")
-        headers = request.headers
+        headers = dict(request.headers)
 
         # 2. Verify Signature (SECURITY CRITICAL)
-        # Dodo uses the Standard Webhooks specification
         try:
             wh = StandardWebhook(WEBHOOK_SECRET)
             wh.verify(payload_str, headers)
@@ -131,57 +130,103 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         event_type = payload.get("type")
         data = payload.get("data", {})
         
-        logger.info(f"Webhook Event: {event_type}")
+        # Log event for debugging
+        payment_id = data.get("payment_id")
+        logger.info(f"Webhook Event: {event_type} | Payment ID: {payment_id}")
 
-        # 1. SUCCESS: Add Credits
+        # ---------------------------------------------------------
+        # 1. HANDLE SUCCESSFUL PAYMENTS (Checkout OR Renewal)
+        # ---------------------------------------------------------
         if event_type == "payment.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
-            plan_name = metadata.get("plan_name")
-            billing_cycle = metadata.get("billing_cycle")
-            subscription_id = data.get("subscription_id")
+            
+            # Strategy A: Try getting credits from metadata (Works for First Checkout)
             credits = int(metadata.get("credits_to_add", 0))
 
-            if user_id and credits > 0:
-                user = db.query(User).filter(User.id == int(user_id)).first()
-                if user:
-                    user.credits += credits
-                    if plan_name:
-                        user.plan = plan_name
-                        user.subscription_status = "active"
-                        user.billing_cycle = billing_cycle
-                    if subscription_id:
-                        user.subscription_id = subscription_id
-                    db.commit()
-                    logger.info(f"SUCCESS: User {user.email} credited +{credits}")
+            # Strategy B: RENEWAL LOGIC (If metadata is missing)
+            if credits == 0:
+                logger.info("Metadata missing. Attempting to identify plan from Product ID (Renewal context).")
+                
+                # Get the product ID from the webhook payload
+                purchased_product_id = data.get("product_id") 
 
-        # 2. FAILURE: Log it for debugging
+                # Look up credits in your PLAN_CONFIG
+                found_plan = False
+                for cycle, plans in PLAN_CONFIG.items():
+                    for name, details in plans.items():
+                        if details["id"] == purchased_product_id:
+                            credits = details["credits"]
+                            found_plan = True
+                            break
+                    if found_plan: break
+                
+                if not found_plan:
+                    logger.error(f"CRITICAL: Unknown Product ID {purchased_product_id} in renewal.")
+                    return {"status": "error", "reason": "unknown_product"}
+
+            # --- USER LOOKUP (Crucial for Renewals) ---
+            user = None
+            
+            # 1. Try ID (from Metadata - only exists on first checkout)
+            if user_id:
+                user = db.query(User).filter(User.id == int(user_id)).first()
+            
+            # 2. Try Subscription ID (This is how we find users on Renewals!)
+            subscription_id = data.get("subscription_id")
+            if not user and subscription_id:
+                user = db.query(User).filter(User.subscription_id == subscription_id).first()
+                
+            # 3. Try Email (Last Resort fallback)
+            if not user:
+                customer_email = data.get("customer", {}).get("email")
+                if customer_email:
+                    user = db.query(User).filter(User.email == customer_email).first()
+
+            # --- UPDATE DATABASE ---
+            if user and credits > 0:
+                # Add Credits
+                user.credits += credits
+                
+                # Update subscription details if available
+                if subscription_id:
+                    user.subscription_id = subscription_id
+                    user.subscription_status = "active"
+                
+                # Update plan/cycle only if metadata exists (usually first checkout)
+                plan_name = metadata.get("plan_name")
+                billing_cycle = metadata.get("billing_cycle")
+                if plan_name: user.plan = plan_name
+                if billing_cycle: user.billing_cycle = billing_cycle
+
+                db.commit()
+                logger.info(f"SUCCESS: User {user.email} credited +{credits}")
+            else:
+                logger.error(f"FAILED: Could not find user for payment {payment_id} or credits were 0")
+
+        # ---------------------------------------------------------
+        # 2. HANDLE FAILURES
+        # ---------------------------------------------------------
         elif event_type == "payment.failed":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
             error_reason = data.get("error_message", "Unknown error")
-            
-            logger.warning(f"PAYMENT FAILED: User {user_id} failed to pay. Reason: {error_reason}")
-            # Optional: You could trigger an email here to ask them to try again.
+            logger.warning(f"PAYMENT FAILED: User {user_id} failed. Reason: {error_reason}")
 
-        # 3. REFUND: Remove Credits (Protect your business)
+        # ---------------------------------------------------------
+        # 3. HANDLE REFUNDS
+        # ---------------------------------------------------------
         elif event_type == "refund.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
-            # Usually we want to remove the same amount we added
             credits_to_remove = int(metadata.get("credits_to_add", 0))
 
             if user_id and credits_to_remove > 0:
                 user = db.query(User).filter(User.id == int(user_id)).first()
                 if user:
-                    # Prevent negative credits
                     user.credits = max(0, user.credits - credits_to_remove)
                     db.commit()
-                    logger.info(f"REFUND PROCESSED: Removed {credits_to_remove} credits from User {user.email}")
-
-        # 4. DISPUTE: (Optional) Handle chargebacks
-        elif event_type == "dispute.opened":
-             logger.critical(f"DISPUTE OPENED: Payment {data.get('payment_id')} is being disputed!")
+                    logger.info(f"REFUND: Removed {credits_to_remove} credits from {user.email}")
 
         return {"status": "received"}
 

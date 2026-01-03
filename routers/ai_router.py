@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import User
 from auth import get_current_user
+import imageio_ffmpeg
 
 router = APIRouter(prefix="/ai", tags=["AI Generation"])
 
@@ -39,22 +40,35 @@ def get_upload_url(token, filename, content_type):
     return response.json()
 
 def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png"):
-    """Downloads video, overlays watermark, and saves to disk."""
-    # Ensure assets folder exists or fail gracefully
+    """
+    Overlays watermark using the python-embedded FFmpeg binary.
+    """
+    try:
+        # 1. GET FFMPEG PATH (From the python library)
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        print(f"⚠️ Could not find FFmpeg binary: {e}. Skipping watermark.")
+        # Fallback: Download original
+        r = requests.get(input_url)
+        with open(output_path, 'wb') as f:
+            f.write(r.content)
+        return
+    
+    # 2. CHECK IF WATERMARK FILE EXISTS
     if not os.path.exists(watermark_path):
-        print(f"Warning: Watermark not found at {watermark_path}. Skipping overlay.")
-        # Fallback: just download the file if watermark is missing
+        print(f"⚠️ Watermark file not found at {watermark_path}. Skipping.")
         r = requests.get(input_url)
         with open(output_path, 'wb') as f:
             f.write(r.content)
         return
 
+    # 3. RUN FFMPEG
     command = [
-        'ffmpeg', '-y',
+        ffmpeg_exe, '-y',
         '-i', input_url,
         '-i', watermark_path,
         '-filter_complex', 'overlay=main_w-overlay_w-10:main_h-overlay_h-10', # Bottom-Right
-        '-c:v', 'libx264', '-preset', 'ultrafast', # ultrafast for speed
+        '-c:v', 'libx264', '-preset', 'ultrafast',
         '-c:a', 'copy',
         output_path
     ]
@@ -63,7 +77,10 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
         subprocess.run(command, check=True, capture_output=True)
     except subprocess.CalledProcessError as e:
         print(f"FFmpeg Error: {e.stderr.decode()}")
-        raise HTTPException(status_code=500, detail="Watermarking failed")
+        # Fallback: Save original if processing fails
+        r = requests.get(input_url)
+        with open(output_path, 'wb') as f:
+            f.write(r.content)
 
 def cleanup_old_files(folder="static", age_limit=1800): 
     """Deletes files older than 30 mins to save space."""

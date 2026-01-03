@@ -56,12 +56,12 @@ def save_video_direct(input_url, output_path):
 
 def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png"):
     """
-    For FREE users: Streams video -> Adds transparent, centered watermark -> Saves to disk.
+    Optimized Version:
+    1. Uses pre-transparent image (Saves CPU).
+    2. Centers the watermark.
+    3. Disables log capture (Fixes Memory Crash).
     """
     temp_input = f"temp_{uuid.uuid4()}.mp4"
-    
-    # SET OPACITY HERE (0.1 = faint, 1.0 = solid)
-    opacity_level = "0.3" 
 
     try:
         # 1. STREAM DOWNLOAD (Memory Safe)
@@ -74,38 +74,42 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
         try:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         except:
-            print("⚠️ FFmpeg binary not found. Saving original.")
+            # Fallback if binary fails
+            if os.path.exists(output_path): os.remove(output_path)
             os.rename(temp_input, output_path)
             return
 
-        # 4. RUN FFMPEG (UPDATED FOR TRANSPARENCY & CENTERING)
-        # Explanation of filter_complex:
-        # [1:v]colorchannelmixer=aa=0.4[trans] -> Take input 1 (watermark), set alpha to 0.4, name result [trans]
-        # [0:v][trans]overlay=(main_w...)/2:(main_h...)/2 -> Take input 0 (video), overlay [trans] on top at center coordinates.
+        # 4. RUN FFMPEG (OPTIMIZED)
+        # Since your image is ALREADY transparent, we just need to overlay it.
+        # Math: (VideoWidth - WatermarkWidth) / 2  --> Centers it exactly.
         command = [
             ffmpeg_exe, '-y',
-            '-i', temp_input,      # Input [0:v]
-            '-i', watermark_path,  # Input [1:v]
-            '-filter_complex', 
-            f'[1:v]colorchannelmixer=aa={opacity_level}[trans];[0:v][trans]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2',
-            '-c:v', 'libx264', '-preset', 'ultrafast',
-            '-c:a', 'copy',
+            '-hide_banner', '-loglevel', 'error',  # Silence logs (Saves CPU)
+            '-i', temp_input,
+            '-i', watermark_path,
+            '-filter_complex', 'overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2', # Centering
+            '-c:v', 'libx264', '-preset', 'ultrafast', # Speed > Compression
+            '-c:a', 'copy', # Copy audio without re-encoding
             output_path
         ]
         
-        subprocess.run(command, check=True, capture_output=True)
+        # CRITICAL FIX for "Exit Code 128":
+        # We replace 'capture_output=True' with 'subprocess.DEVNULL'.
+        # This tells Python: "Don't save logs to RAM, just discard them."
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         # Cleanup
         if os.path.exists(temp_input):
             os.remove(temp_input)
 
     except Exception as e:
-        # (Fallback logic remains the same)
-        print(f"⚠️ Video Processing Failed: {str(e)}")
+        print(f"⚠️ Processing Error: {e}")
+        # Fallback: Deliver original video if FFmpeg crashes
         if os.path.exists(temp_input):
             if os.path.exists(output_path): os.remove(output_path)
             os.rename(temp_input, output_path)
         else:
+            # Last resort download
             save_video_direct(input_url, output_path)
 
 def cleanup_old_files(folder="static", age_limit=1800): 

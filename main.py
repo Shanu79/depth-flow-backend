@@ -6,6 +6,7 @@ from routers import auth_router, ai_router, payments_router, admin_router
 from dotenv import load_dotenv
 import os
 from pathlib import Path
+from fastapi.staticfiles import StaticFiles
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -15,6 +16,8 @@ load_dotenv()
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(
     CORSMiddleware,

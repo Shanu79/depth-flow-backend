@@ -173,7 +173,9 @@ async def generate_3d(
         input_disparity_url = disp_response.json().get('resultPresignedUrl')
 
         # 3. CONFIGURE PHYSICS
-        intensity = float(depth)
+        safe_depth = min(float(depth), 8.0) 
+        
+        intensity = safe_depth
         params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
 
         if style == "Orbit":
@@ -184,9 +186,13 @@ async def generate_3d(
             params["amplitudeZ"] = intensity
             params["amplitudeX"] = intensity * 0.1
         elif style == "Zoom":
-            params["amplitudeZ"] = intensity * 1.2
+            params["amplitudeZ"] = intensity * 1.2 # 8.0 * 1.2 = 9.6 (Safe)
         elif style == "Horizontal":
             params["amplitudeX"] = intensity
+            
+        for key in ["amplitudeX", "amplitudeY", "amplitudeZ"]:
+            if params[key] > 10:
+                params[key] = 10.0
             
         animation_correlation_id = str(uuid.uuid4())
 

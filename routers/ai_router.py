@@ -56,10 +56,10 @@ def save_video_direct(input_url, output_path):
 
 def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png"):
     """
-    Optimized Version:
-    1. Uses pre-transparent image (Saves CPU).
-    2. Centers the watermark.
-    3. Disables log capture (Fixes Memory Crash).
+    Final Optimization:
+    1. Downscales video to 720p (Prevents Memory Crash).
+    2. Centers watermark.
+    3. Silences logs (Prevents Buffer Crash).
     """
     temp_input = f"temp_{uuid.uuid4()}.mp4"
 
@@ -70,32 +70,33 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
             with open(temp_input, 'wb') as f:
                 shutil.copyfileobj(r.raw, f)
 
-        # 2. GET FFMPEG PATH
+        # 2. CHECK FFMPEG & WATERMARK
         try:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         except:
-            # Fallback if binary fails
-            if os.path.exists(output_path): os.remove(output_path)
+            # Fallback
             os.rename(temp_input, output_path)
             return
 
-        # 4. RUN FFMPEG (OPTIMIZED)
-        # Since your image is ALREADY transparent, we just need to overlay it.
-        # Math: (VideoWidth - WatermarkWidth) / 2  --> Centers it exactly.
+        if not os.path.exists(watermark_path):
+            os.rename(temp_input, output_path)
+            return
+
+        # 3. RUN FFMPEG (DOWNSCALED 720P)
+        # 'scale=-2:720' forces height to 720p, maintaining aspect ratio.
+        # This drastically reduces RAM usage.
         command = [
             ffmpeg_exe, '-y',
-            '-hide_banner', '-loglevel', 'error',  # Silence logs (Saves CPU)
+            '-hide_banner', '-loglevel', 'error', 
             '-i', temp_input,
             '-i', watermark_path,
-            '-filter_complex', 'overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2', # Centering
-            '-c:v', 'libx264', '-preset', 'ultrafast', # Speed > Compression
-            '-c:a', 'copy', # Copy audio without re-encoding
+            '-filter_complex', '[0:v]scale=-2:720[bg];[bg][1:v]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2',
+            '-c:v', 'libx264', '-preset', 'ultrafast',
+            '-c:a', 'copy',
             output_path
         ]
         
-        # CRITICAL FIX for "Exit Code 128":
-        # We replace 'capture_output=True' with 'subprocess.DEVNULL'.
-        # This tells Python: "Don't save logs to RAM, just discard them."
+        # DISCARD LOGS (Fixes Exit Code 128 buffer overflow)
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         # Cleanup
@@ -103,13 +104,12 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
             os.remove(temp_input)
 
     except Exception as e:
-        print(f"⚠️ Processing Error: {e}")
-        # Fallback: Deliver original video if FFmpeg crashes
+        print(f"⚠️ Limit Reached: {e}")
+        # FAIL-SAFE: If it STILL crashes, just save the original immediately.
         if os.path.exists(temp_input):
             if os.path.exists(output_path): os.remove(output_path)
             os.rename(temp_input, output_path)
         else:
-            # Last resort download
             save_video_direct(input_url, output_path)
 
 def cleanup_old_files(folder="static", age_limit=1800): 

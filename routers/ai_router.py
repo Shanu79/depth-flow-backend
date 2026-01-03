@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import User
 from auth import get_current_user
+import shutil
 
 router = APIRouter(prefix="/ai", tags=["AI Generation"])
 
@@ -41,29 +42,37 @@ def get_upload_url(token, filename, content_type):
 
 def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png"):
     """
-    Downloads video first, then overlays watermark using python-embedded FFmpeg.
+    Memory-Safe Version: Streams video to disk to prevent Server Crash (OOM).
     """
     temp_input = f"temp_{uuid.uuid4()}.mp4"
 
     try:
-        # 1. DOWNLOAD VIDEO FIRST (Fixes FFmpeg network errors)
-        r = requests.get(input_url)
-        with open(temp_input, 'wb') as f:
-            f.write(r.content)
+        # 1. STREAM DOWNLOAD (Fixes 'Exit Code 128' / OOM Crash)
+        # We use stream=True and shutil.copyfileobj to avoid loading file into RAM
+        with requests.get(input_url, stream=True) as r:
+            r.raise_for_status()
+            with open(temp_input, 'wb') as f:
+                shutil.copyfileobj(r.raw, f)
 
         # 2. GET FFMPEG PATH
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        
-        # 3. CHECK WATERMARK
-        if not os.path.exists(watermark_path):
-            print(f"⚠️ Watermark missing. Saving original.")
+        try:
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except:
+            print("⚠️ FFmpeg binary not found. Saving original.")
             os.rename(temp_input, output_path)
             return
 
-        # 4. RUN FFMPEG (Local file -> Local file)
+        # 3. CHECK WATERMARK
+        if not os.path.exists(watermark_path):
+            print(f"⚠️ Watermark missing at {watermark_path}. Saving original.")
+            os.rename(temp_input, output_path)
+            return
+
+        # 4. RUN FFMPEG
+        # We add '-y' to force overwrite and '-preset ultrafast' for speed
         command = [
             ffmpeg_exe, '-y',
-            '-i', temp_input,      # Input is now local file
+            '-i', temp_input, 
             '-i', watermark_path,
             '-filter_complex', 'overlay=main_w-overlay_w-10:main_h-overlay_h-10',
             '-c:v', 'libx264', '-preset', 'ultrafast',
@@ -71,29 +80,29 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
             output_path
         ]
         
+        # Run FFmpeg (Capture output so it doesn't leak to logs unless error)
         subprocess.run(command, check=True, capture_output=True)
-        
-        # Clean up temp file
+
+        # Cleanup temp file
         if os.path.exists(temp_input):
             os.remove(temp_input)
 
     except Exception as e:
-        # If it was a subprocess error, print stderr for debugging
-        if isinstance(e, subprocess.CalledProcessError):
-            print(f"FFmpeg Error Details: {e.stderr.decode()}")
-        else:
-            print(f"Processing Error: {str(e)}")
-            
-        # FALLBACK: Just save the downloaded file as output
+        print(f"⚠️ Video Processing Failed: {str(e)}")
+        # CRITICAL FALLBACK: Ensure user still gets a video even if processing fails
         if os.path.exists(temp_input):
+            # Move the downloaded temp file to the final output path
             if os.path.exists(output_path):
                 os.remove(output_path)
             os.rename(temp_input, output_path)
         else:
-            # If download failed, try streaming direct to output (last resort)
-            r = requests.get(input_url)
-            with open(output_path, 'wb') as f:
-                f.write(r.content)
+            # If download failed entirely, try one last direct stream to output
+            try:
+                with requests.get(input_url, stream=True) as r:
+                    with open(output_path, 'wb') as f:
+                        shutil.copyfileobj(r.raw, f)
+            except:
+                print("❌ Fatal: Could not save video.")
 
 def cleanup_old_files(folder="static", age_limit=1800): 
     """Deletes files older than 30 mins."""

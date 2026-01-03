@@ -117,7 +117,7 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         payload_str = payload_bytes.decode("utf-8")
         headers = dict(request.headers)
 
-        # 2. Verify Signature (SECURITY CRITICAL)
+        # 2. Verify Signature
         try:
             wh = StandardWebhook(WEBHOOK_SECRET)
             wh.verify(payload_str, headers)
@@ -129,29 +129,25 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         payload = await request.json()
         event_type = payload.get("type")
         data = payload.get("data", {})
-        
-        # Log event for debugging
-        payment_id = data.get("payment_id")
+        payment_id = data.get("payment_id") # Only for logging now
+
         logger.info(f"Webhook Event: {event_type} | Payment ID: {payment_id}")
 
-        # ---------------------------------------------------------
-        # 1. HANDLE SUCCESSFUL PAYMENTS (Checkout OR Renewal)
-        # ---------------------------------------------------------
+        # 1. SUCCESS: Add Credits
         if event_type == "payment.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
-            
-            # Strategy A: Try getting credits from metadata (Works for First Checkout)
+            plan_name = metadata.get("plan_name")
+            billing_cycle = metadata.get("billing_cycle")
+            subscription_id = data.get("subscription_id")
             credits = int(metadata.get("credits_to_add", 0))
 
-            # Strategy B: RENEWAL LOGIC (If metadata is missing)
+            # --- RENEWAL LOGIC: Calculate credits if metadata is missing ---
             if credits == 0:
-                logger.info("Metadata missing. Attempting to identify plan from Product ID (Renewal context).")
+                logger.info("Metadata missing. Checking Product ID for renewal.")
+                purchased_product_id = data.get("product_id")
                 
-                # Get the product ID from the webhook payload
-                purchased_product_id = data.get("product_id") 
-
-                # Look up credits in your PLAN_CONFIG
+                # Find credits from config
                 found_plan = False
                 for cycle, plans in PLAN_CONFIG.items():
                     for name, details in plans.items():
@@ -165,19 +161,18 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                     logger.error(f"CRITICAL: Unknown Product ID {purchased_product_id} in renewal.")
                     return {"status": "error", "reason": "unknown_product"}
 
-            # --- USER LOOKUP (Crucial for Renewals) ---
+            # --- USER LOOKUP ---
             user = None
             
-            # 1. Try ID (from Metadata - only exists on first checkout)
+            # A. Try ID (First Checkout)
             if user_id:
                 user = db.query(User).filter(User.id == int(user_id)).first()
             
-            # 2. Try Subscription ID (This is how we find users on Renewals!)
-            subscription_id = data.get("subscription_id")
+            # B. Try Subscription ID (Renewals)
             if not user and subscription_id:
                 user = db.query(User).filter(User.subscription_id == subscription_id).first()
                 
-            # 3. Try Email (Last Resort fallback)
+            # C. Try Email (Fallback)
             if not user:
                 customer_email = data.get("customer", {}).get("email")
                 if customer_email:
@@ -185,37 +180,30 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
 
             # --- UPDATE DATABASE ---
             if user and credits > 0:
-                # Add Credits
                 user.credits += credits
                 
-                # Update subscription details if available
+                # Save Subscription ID (Crucial for next month's renewal)
                 if subscription_id:
                     user.subscription_id = subscription_id
                     user.subscription_status = "active"
                 
-                # Update plan/cycle only if metadata exists (usually first checkout)
-                plan_name = metadata.get("plan_name")
-                billing_cycle = metadata.get("billing_cycle")
+                # Update Plan Details (Usually only in metadata on first checkout)
                 if plan_name: user.plan = plan_name
                 if billing_cycle: user.billing_cycle = billing_cycle
 
                 db.commit()
                 logger.info(f"SUCCESS: User {user.email} credited +{credits}")
             else:
-                logger.error(f"FAILED: Could not find user for payment {payment_id} or credits were 0")
+                logger.error(f"FAILED: Could not find user for payment {payment_id}")
 
-        # ---------------------------------------------------------
-        # 2. HANDLE FAILURES
-        # ---------------------------------------------------------
+        # 2. FAILURE: Log it
         elif event_type == "payment.failed":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
             error_reason = data.get("error_message", "Unknown error")
             logger.warning(f"PAYMENT FAILED: User {user_id} failed. Reason: {error_reason}")
 
-        # ---------------------------------------------------------
-        # 3. HANDLE REFUNDS
-        # ---------------------------------------------------------
+        # 3. REFUND: Remove Credits
         elif event_type == "refund.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")

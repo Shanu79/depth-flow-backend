@@ -57,7 +57,7 @@ def save_video_direct(input_url, output_path):
 
 def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png"):
     """
-    Low-RAM Optimized Version: Uses single-thread processing to prevent OOM (Exit 128).
+    Low-RAM Optimized Version: Applies watermark to the WHOLE video (Full Screen).
     """
     temp_input = f"temp_{uuid.uuid4()}.mp4"
 
@@ -69,7 +69,6 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
                 shutil.copyfileobj(r.raw, f)
 
         # 2. FORCE GARBAGE COLLECTION
-        # Clear any request buffers before starting heavy FFmpeg process
         gc.collect()
 
         # 3. GET FFMPEG PATH
@@ -81,23 +80,23 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
             return
 
         if not os.path.exists(watermark_path):
-            print(f"⚠️ Watermark missing. Saving original.")
+            print(f"⚠️ Watermark missing at {watermark_path}. Saving original.")
             os.rename(temp_input, output_path)
             return
 
         # 4. RUN FFMPEG (LOW MEMORY MODE)
-        # -threads 1: Crucial for 512MB RAM. Prevents spawning multiple memory-hungry threads.
-        # -max_muxing_queue_size 1024: Prevents buffer bloat.
+        # [1:v][0:v]scale2ref[wm][vid] -> Scales watermark (1) to match video (0) dimensions
+        # [vid][wm]overlay=0:0 -> Applies scaled watermark over the video starting at top-left
         command = [
             ffmpeg_exe, '-y',
             '-i', temp_input, 
             '-i', watermark_path,
-            '-filter_complex', 'overlay=main_w-overlay_w-10:main_h-overlay_h-10',
+            '-filter_complex', '[1:v][0:v]scale2ref[wm][vid];[vid][wm]overlay=0:0',
             '-c:v', 'libx264', 
             '-preset', 'ultrafast',  
             '-threads', '1',         
             '-c:a', 'copy',
-            '-max_muxing_queue_size', '1024', # Prevent buffer overflow
+            '-max_muxing_queue_size', '1024', 
             output_path
         ]
 
@@ -108,13 +107,12 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
 
     except Exception as e:
         print(f"⚠️ Video Processing Failed: {str(e)}")
-        # Fallback: Deliver non-watermarked video rather than crashing
+        # Fallback logic
         if os.path.exists(temp_input):
             if os.path.exists(output_path):
                 os.remove(output_path)
             os.rename(temp_input, output_path)
         else:
-            # Last resort stream copy
             try:
                 with requests.get(input_url, stream=True) as r:
                     with open(output_path, 'wb') as f:

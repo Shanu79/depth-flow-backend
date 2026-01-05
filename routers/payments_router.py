@@ -139,7 +139,6 @@ async def cancel_subscription(
 
         # 2. Update Local Database
         current_user.subscription_status = "canceled"
-        current_user.plan = "Free"
         current_user.subscription_id = None 
         current_user.billing_cycle = None 
         

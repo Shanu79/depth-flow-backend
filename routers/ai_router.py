@@ -186,9 +186,10 @@ async def generate_3d(
         elif style == "Dolly":
             # Moves physically Forward/Backward
             # UPDATED: Changed fixed '0.1' to 'intensity * 0.1' for dynamic drift
-            params["amplitudeX"] = intensity * 0.1
-            params["amplitudeZ"] = intensity * 0.9   
-            params["phaseX"] = 0.0
+            params["amplitudeX"] = intensity * 0.3
+            params["amplitudeZ"] = intensity * 1.0
+            params["phaseX"] = 0.5                   # 0.5 offset = "Push-Pull" tension
+            params["amplitudeY"] = 0.0
 
         elif style == "Zoom":
             # Rapid magnification

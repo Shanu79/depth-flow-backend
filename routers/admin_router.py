@@ -25,7 +25,7 @@ def get_current_admin(current_user: User = Depends(get_current_user)):
 @router.get("/users", response_model=List[UserResponse])
 def get_all_users(
     skip: int = 0, 
-    limit: int = 100, 
+    limit: int = 100000, 
     db: Session = Depends(get_db), 
     admin: User = Depends(get_current_admin) # <--- Enforce Admin Check
 ):

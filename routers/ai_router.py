@@ -225,15 +225,20 @@ async def generate_3d(
         immersity_video_url = response.json().get('resultPresignedUrl')
 
         # --- 5. WATERMARK LOGIC ---
-        is_free_user = current_user.plan.lower() == "free"
+        is_free_plan = current_user.plan.lower() == "free"
+        is_ex_subscriber = current_user.subscription_status == "canceled"
+        
+        should_watermark = is_free_plan and not is_ex_subscriber
 
-        if is_free_user:
+        if should_watermark:
             filename = f"{correlation_id}_branded.mp4"
             output_path = f"static/{filename}"
+            
             apply_watermark(immersity_video_url, output_path)
         else:
             filename = f"{correlation_id}_clean.mp4"
             output_path = f"static/{filename}"
+            
             save_video_direct(immersity_video_url, output_path)
 
         # 6. CLEANUP & RETURN

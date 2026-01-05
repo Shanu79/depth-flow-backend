@@ -34,7 +34,7 @@ client = DodoPayments(
     environment="live_mode" 
 )
 
-DODO_BASE_URL = "https://live.dodopayments.com" 
+DODO_API_URL = "https://api.dodopayments.com/v1" 
 
 PLAN_CONFIG = {
     "monthly": {
@@ -54,37 +54,32 @@ class CheckoutRequest(BaseModel):
     billing_cycle: str
     quantity: int = 1
 
-# --- HELPER: CORRECTED CANCELLATION LOGIC ---
+# --- HELPER: CANCELLATION LOGIC ---
 def cancel_dodo_subscription_raw(subscription_id: str):
     """
     Cancels a subscription using the raw Dodo API.
-    CORRECTION: Uses DELETE method on the ID directly.
     """
     try:
-        # 1. Correct URL (Remove /cancel)
-        url = f"{DODO_BASE_URL}/subscriptions/{subscription_id}"
-        
+        url = f"{DODO_API_URL}/subscriptions/{subscription_id}/cancel"
         headers = {
             "Authorization": f"Bearer {DODO_API_KEY}",
             "Content-Type": "application/json"
         }
-
-        # 2. Use DELETE instead of POST
-        response = requests.delete(url, headers=headers)
         
-        # 3. Handle 404 (Already cancelled/Not found) gracefully
-        if response.status_code == 404:
-            logger.info(f"Subscription {subscription_id} not found on Dodo (already cancelled?). Marking local as cancelled.")
+        response = requests.post(url, headers=headers)
+        
+        if response.status_code == 200:
             return True
-
-        # Check for other errors
+        elif response.status_code == 404:
+            return True 
+        
+        # Raise error for unexpected failures
         response.raise_for_status()
-                
         return True
     except Exception as e:
         logger.error(f"Raw API Cancel failed: {e}")
-        # We re-raise to handle it in the endpoint
-        raise e
+        # We don't raise here to allow local DB cleanup to proceed
+        pass
 
 # --- 3. ENDPOINTS ---
 
@@ -135,18 +130,11 @@ async def cancel_subscription(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Cancels the user's active subscription and downgrades to Free.
-    """
     if not current_user.subscription_id:
         raise HTTPException(status_code=400, detail="No active subscription found.")
 
     try:
-        logger.info(f"Attempting to cancel subscription: {current_user.subscription_id}")
-        
-        # 1. Call Dodo API (Using Fixed Helper)
-        # Even if Dodo returns 404 (Not Found), the helper returns True 
-        # because our goal (stopping billing) is achieved.
+        # 1. Call Dodo API
         cancel_dodo_subscription_raw(current_user.subscription_id)
 
         # 2. Update Local Database
@@ -161,12 +149,13 @@ async def cancel_subscription(
 
     except Exception as e:
         logger.error(f"Cancellation Failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to cancel subscription: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to cancel: {str(e)}")
 
 
 @router.post("/webhook")
 async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
     try:
+        # 1. Verification
         payload_bytes = await request.body()
         payload_str = payload_bytes.decode("utf-8")
         headers = dict(request.headers)
@@ -178,12 +167,14 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
             logger.error(f"Webhook Signature Verification Failed: {e}")
             raise HTTPException(status_code=400, detail="Invalid signature")
 
+        # 2. Parse Event
         payload = await request.json()
         event_type = payload.get("type")
         data = payload.get("data", {})
         
         logger.info(f"Webhook Event: {event_type}")
 
+        # --- EVENT: PAYMENT SUCCEEDED ---
         if event_type == "payment.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
@@ -202,15 +193,9 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                  if email: user = db.query(User).filter(User.email == email).first()
 
             if user:
-                # UPGRADE LOGIC
+                # Upgrade Logic: Cancel old sub if ID changed
                 if user.subscription_id and new_subscription_id and user.subscription_id != new_subscription_id:
-                    logger.info(f"UPGRADE DETECTED: Swapping {user.subscription_id} -> {new_subscription_id}")
-                    try:
-                        # Use updated helper
-                        cancel_dodo_subscription_raw(user.subscription_id)
-                        logger.info("Old subscription cancelled successfully.")
-                    except Exception as e:
-                        logger.error(f"Failed to auto-cancel old subscription during upgrade: {e}")
+                    cancel_dodo_subscription_raw(user.subscription_id)
 
                 if credits > 0:
                     user.credits += credits
@@ -223,6 +208,24 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                 if billing_cycle: user.billing_cycle = billing_cycle
 
                 db.commit()
+
+        # --- EVENT: SUBSCRIPTION CANCELLED ---
+        # Handles external cancellations or expirations
+        elif event_type == "subscription.cancelled":
+            subscription_id = data.get("subscription_id")
+            
+            if subscription_id:
+                user = db.query(User).filter(User.subscription_id == subscription_id).first()
+                
+                if user:
+                    user.subscription_status = "canceled"
+                    user.plan = "Free"
+                    user.subscription_id = None
+                    user.billing_cycle = None
+                    db.commit()
+                    logger.info(f"Subscription {subscription_id} cancelled via Webhook for {user.email}")
+                else:
+                    logger.warning(f"Received cancel webhook for unknown subscription: {subscription_id}")
 
         return {"status": "received"}
 

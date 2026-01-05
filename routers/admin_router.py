@@ -54,4 +54,15 @@ def delete_user(
     db.delete(user_to_delete)
     db.commit()
     
+    # --- NEW CHECK: Prevent deleting other admins ---
+    if user_to_delete.is_admin:
+        raise HTTPException(
+            status_code=403, # 403 Forbidden is semantically better here
+            detail="You cannot delete another admin account."
+        )
+
+    # 3. Delete
+    db.delete(user_to_delete)
+    db.commit()
+    
     return {"status": "success", "message": f"User {user_to_delete.email} deleted successfully"}

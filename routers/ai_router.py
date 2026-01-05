@@ -186,8 +186,12 @@ async def generate_3d(
         elif style == "Dolly":
             # Moves physically Forward/Backward
             # UPDATED: Changed fixed '0.1' to 'intensity * 0.1' for dynamic drift
-            params["amplitudeX"] = intensity * 0.05   # Moderate width spiral
+            params["amplitudeX"] = intensity * 0.5   # Moderate width spiral
+            params["amplitudeY"] = intensity * 0.5
             params["amplitudeZ"] = intensity * 0.1
+            params["phaseX"] = 0.0
+            params["phaseY"] = 0.25                  # Offset Y to make it a circle, not a diagonal line
+            params["phaseZ"] = 0.0
 
         elif style == "Zoom":
             # Rapid magnification

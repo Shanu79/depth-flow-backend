@@ -136,9 +136,9 @@ def cleanup_old_files(folder="static", age_limit=1800):
 async def generate_3d(
     file: UploadFile = File(...),
     style: str = Form("Dolly"),
-    depth: int = Form(5),    # Controls Base 3D Intensity (1-10)
-    speed: int = Form(5),    # Controls Visual Velocity (1-10)
-    duration: int = Form(5), # Controls Video Length (Seconds)
+    depth: int = Form(5),    # 1-10: How "deep" the 3D effect is (Base Amplitude)
+    speed: int = Form(5),    # 1-10: How fast the camera moves (Velocity Multiplier)
+    duration: int = Form(5), # 1-10: Length of the video in seconds
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -169,30 +169,29 @@ async def generate_3d(
         disp_response.raise_for_status()
         input_disparity_url = disp_response.json().get('resultPresignedUrl')
 
-        # 3. CONFIGURE PHYSICS (Speed & Duration Logic)
+        # 3. CONFIGURE PHYSICS (The "Decoupling" Math)
         
-        # A. Base Depth (Spatial Scale)
+        # Base Depth: The user's desired spatial scale (1-10)
         base_depth = float(depth)
 
-        # B. Speed Multiplier
-        # If user wants "Fast" (10), we increase amplitude. 
-        # If user wants "Slow" (1), we decrease amplitude.
-        # Normalized around 5.0 (so 5 is "1x" speed)
-        speed_factor = float(speed) / 5.0 
+        # Speed Factor: 
+        # 5 is "1x" speed. 10 is "2x" speed.
+        speed_multiplier = float(speed) / 5.0 
 
-        # C. Duration Compensation
-        # If video is long (10s), motion feels slower unless we increase distance.
-        # We normalize against a standard 5s clip. 
-        # 10s clip gets 2x amplitude to maintain same visual speed as 5s clip.
-        time_factor = float(duration) / 5.0
+        # Duration Factor: 
+        # A 10s video is naturally 2x slower than a 5s video.
+        # We must double the amplitude to compensate and keep the speed constant.
+        time_compensation = float(duration) / 5.0
 
-        # Calculate Final Intensity
-        # intensity = Depth * SpeedModifier * DurationCompensation
-        raw_intensity = base_depth * speed_factor * time_factor
+        # Final Intensity Calculation
+        # Amplitude = BaseDepth * DesiredVelocity * DurationCompensation
+        raw_intensity = base_depth * speed_multiplier * time_compensation
 
-        # Safety Cap: Immersity API typically breaks or looks bad above 10.0
+        # API Safety Cap: Immersity usually limits amplitude to 10.0.
+        # Note: If raw_intensity > 10, the video will physically hit the speed limit 
+        # and might look slower than requested.
         intensity = min(raw_intensity, 10.0)
-        intensity = max(intensity, 0.5) # Minimum movement to avoid freezing
+        intensity = max(intensity, 0.5) # Prevent 0 (no motion)
 
         # Initialize params
         params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
@@ -204,7 +203,7 @@ async def generate_3d(
             params["phaseY"] = 0.25
 
         elif style == "Dolly":
-            # Horizontal Truck/Slider with slight depth push
+            # Horizontal Truck/Slider (Distinct from Zoom)
             params["amplitudeX"] = intensity * 0.8
             params["amplitudeZ"] = intensity * 0.3
             params["phaseX"] = 0.0
@@ -217,11 +216,13 @@ async def generate_3d(
         animation_correlation_id = str(uuid.uuid4())
 
         # 4. GENERATE ANIMATION
+        # We pass 'duration' to animationLength, but NOT 'speed'. 
+        # Speed is baked into the 'params' (amplitudes) above.
         anim_payload = {
             "correlationId": animation_correlation_id,
             "inputImageUrl": input_image_url,
             "inputDisparityUrl": input_disparity_url,
-            "animationLength": float(duration), # Directly set duration here
+            "animationLength": float(duration), 
             **params
         }
 

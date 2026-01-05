@@ -171,25 +171,36 @@ async def generate_3d(
         input_disparity_url = disp_response.json().get('resultPresignedUrl')
 
         # 3. CONFIGURE PHYSICS
+        # 
         safe_depth = min(float(depth), 8.0) 
-        
         intensity = safe_depth
+        
+        # Initialize all params to 0
         params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
 
         if style == "Orbit":
+            # Circular motion (X + Y sine/cosine)
             params["amplitudeX"] = intensity
             params["amplitudeY"] = intensity * 0.5
-            params["phaseY"] = 0.25
-        elif style == "Dolly":
-            params["amplitudeZ"] = intensity
-            params["amplitudeX"] = intensity * 0.1
-        elif style == "Zoom":
-            params["amplitudeZ"] = intensity * 1.2 # 8.0 * 1.2 = 9.6 (Safe)
-        elif style == "Horizontal":
-            params["amplitudeX"] = intensity
+            params["phaseY"] = 0.25 # Creates the circular offset
             
+        elif style == "Dolly":
+            # UPDATED: Changed from Z to X/Y mix (Slider/Truck effect)
+            # This makes it distinct from 'Zoom'. It moves side-to-side (Truck) 
+            # with a tiny bit of forward movement to create a 3D parallax 'slider' look.
+            params["amplitudeX"] = intensity * 0.8  # Primary movement is Horizontal (Slider)
+            params["amplitudeZ"] = intensity * 0.2  # Slight depth push for 3D feel
+            params["phaseX"] = 0.0
+
+        elif style == "Zoom":
+            # Pure Z-axis movement (In/Out)
+            params["amplitudeZ"] = intensity * 1.2 
+            
+        # Removed "Horizontal" block as requested
+
+        # Safety Cap (Immersity API usually limits amplitude to 10.0)
         for key in ["amplitudeX", "amplitudeY", "amplitudeZ"]:
-            if params[key] > 10:
+            if params[key] > 10.0:
                 params[key] = 10.0
             
         animation_correlation_id = str(uuid.uuid4())
@@ -218,20 +229,16 @@ async def generate_3d(
 
         immersity_video_url = response.json().get('resultPresignedUrl')
 
-        # --- 5. WATERMARK LOGIC (UPDATED) ---
-        
-        # Check User Plan
+        # --- 5. WATERMARK LOGIC ---
         is_free_user = current_user.plan.lower() == "free"
 
         if is_free_user:
             filename = f"{correlation_id}_branded.mp4"
             output_path = f"static/{filename}"
-            # Apply Watermark (Heavy Processing)
             apply_watermark(immersity_video_url, output_path)
         else:
             filename = f"{correlation_id}_clean.mp4"
             output_path = f"static/{filename}"
-            # Direct Download (Light Processing)
             save_video_direct(immersity_video_url, output_path)
 
         # 6. CLEANUP & RETURN
@@ -245,7 +252,7 @@ async def generate_3d(
         return {
             "status": "success", 
             "video_url": final_url,
-            "plan": current_user.plan, # Helpful for frontend to show "Upgrade" badge
+            "plan": current_user.plan,
             "remaining_credits": current_user.credits
         }
 

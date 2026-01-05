@@ -136,8 +136,9 @@ def cleanup_old_files(folder="static", age_limit=1800):
 async def generate_3d(
     file: UploadFile = File(...),
     style: str = Form("Dolly"),
-    depth: int = Form(5),
-    speed: int = Form(5),
+    depth: int = Form(5),    # Controls Base 3D Intensity (1-10)
+    speed: int = Form(5),    # Controls Visual Velocity (1-10)
+    duration: int = Form(5), # Controls Video Length (Seconds)
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -168,34 +169,49 @@ async def generate_3d(
         disp_response.raise_for_status()
         input_disparity_url = disp_response.json().get('resultPresignedUrl')
 
-        # 3. CONFIGURE PHYSICS
-        # UPDATED: Changed limit from 8.0 to 10.0 to match frontend
-        safe_depth = min(float(depth), 10.0) 
-        intensity = safe_depth
+        # 3. CONFIGURE PHYSICS (Speed & Duration Logic)
         
-        # Initialize all params to 0
+        # A. Base Depth (Spatial Scale)
+        base_depth = float(depth)
+
+        # B. Speed Multiplier
+        # If user wants "Fast" (10), we increase amplitude. 
+        # If user wants "Slow" (1), we decrease amplitude.
+        # Normalized around 5.0 (so 5 is "1x" speed)
+        speed_factor = float(speed) / 5.0 
+
+        # C. Duration Compensation
+        # If video is long (10s), motion feels slower unless we increase distance.
+        # We normalize against a standard 5s clip. 
+        # 10s clip gets 2x amplitude to maintain same visual speed as 5s clip.
+        time_factor = float(duration) / 5.0
+
+        # Calculate Final Intensity
+        # intensity = Depth * SpeedModifier * DurationCompensation
+        raw_intensity = base_depth * speed_factor * time_factor
+
+        # Safety Cap: Immersity API typically breaks or looks bad above 10.0
+        intensity = min(raw_intensity, 10.0)
+        intensity = max(intensity, 0.5) # Minimum movement to avoid freezing
+
+        # Initialize params
         params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
 
         if style == "Orbit":
-            # Moves in a circle/oval around the subject
-            params["amplitudeX"] = intensity * 1.0   
-            params["amplitudeY"] = intensity * 0.5   
-            params["phaseX"] = 0.0
-            params["phaseY"] = 0.25                  
+            # Circular motion
+            params["amplitudeX"] = intensity * 1.0
+            params["amplitudeY"] = intensity * 0.5
+            params["phaseY"] = 0.25
 
         elif style == "Dolly":
-            # Moves physically Forward/Backward
-            # UPDATED: Changed fixed '0.1' to 'intensity * 0.1' for dynamic drift
-            params["amplitudeX"] = intensity * 0.5   # Moderate width spiral
-            params["amplitudeY"] = intensity * 0.5
-            params["amplitudeZ"] = intensity * 0.1
+            # Horizontal Truck/Slider with slight depth push
+            params["amplitudeX"] = intensity * 0.8
+            params["amplitudeZ"] = intensity * 0.3
             params["phaseX"] = 0.0
-            params["phaseY"] = 0.25                  # Offset Y to make it a circle, not a diagonal line
-            params["phaseZ"] = 0.0
 
         elif style == "Zoom":
-            # Rapid magnification
-            params["amplitudeZ"] = intensity * 1.0   
+            # Pure Z-axis depth
+            params["amplitudeZ"] = intensity * 1.0 
             params["amplitudeX"] = 0.0
             
         animation_correlation_id = str(uuid.uuid4())
@@ -205,7 +221,7 @@ async def generate_3d(
             "correlationId": animation_correlation_id,
             "inputImageUrl": input_image_url,
             "inputDisparityUrl": input_disparity_url,
-            "animationLength": float(speed),
+            "animationLength": float(duration), # Directly set duration here
             **params
         }
 
@@ -233,12 +249,10 @@ async def generate_3d(
         if should_watermark:
             filename = f"{correlation_id}_branded.mp4"
             output_path = f"static/{filename}"
-            
             apply_watermark(immersity_video_url, output_path)
         else:
             filename = f"{correlation_id}_clean.mp4"
             output_path = f"static/{filename}"
-            
             save_video_direct(immersity_video_url, output_path)
 
         # 6. CLEANUP & RETURN

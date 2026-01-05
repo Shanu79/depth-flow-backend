@@ -132,8 +132,6 @@ def cleanup_old_files(folder="static", age_limit=1800):
                 try: os.remove(file_path)
                 except: pass
 
-# --- ROUTES ---
-
 @router.post("/generate-3d")
 async def generate_3d(
     file: UploadFile = File(...),
@@ -171,34 +169,31 @@ async def generate_3d(
         input_disparity_url = disp_response.json().get('resultPresignedUrl')
 
         # 3. CONFIGURE PHYSICS
-        # 
-        safe_depth = min(float(depth), 8.0) 
+        # UPDATED: Changed limit from 8.0 to 10.0 to match frontend
+        safe_depth = min(float(depth), 10.0) 
         intensity = safe_depth
         
         # Initialize all params to 0
-    params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
+        params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
 
-    if style == "Orbit":
-        # Moves in a circle/oval around the subject
-        # Uses X and Y with a phase offset to create rotation
-        params["amplitudeX"] = intensity * 1.0   # Max 10 (Full width)
-        params["amplitudeY"] = intensity * 0.5   # Max 5  (Half height for cinematic oval)
-        params["phaseX"] = 0.0
-        params["phaseY"] = 0.25                  # 0.25 offset creates the circular "orbit" motion
+        if style == "Orbit":
+            # Moves in a circle/oval around the subject
+            params["amplitudeX"] = intensity * 1.0   
+            params["amplitudeY"] = intensity * 0.5   
+            params["phaseX"] = 0.0
+            params["phaseY"] = 0.25                  
 
-    elif style == "Dolly":
-        # Moves physically Forward/Backward
-        # Swapped from X (Truck) to Z (True Dolly)
-        params["amplitudeX"] = 0.1
-        params["amplitudeZ"] = intensity * 0.9   # Max 10 (Full depth movement)
-        params["phaseX"] = 0.0
+        elif style == "Dolly":
+            # Moves physically Forward/Backward
+            # UPDATED: Changed fixed '0.1' to 'intensity * 0.1' for dynamic drift
+            params["amplitudeX"] = intensity * 0.1
+            params["amplitudeZ"] = intensity * 0.9   
+            params["phaseX"] = 0.0
 
-    elif style == "Zoom":
-        # Rapid magnification
-        # FIX: Capped at 1.0 to ensure result never exceeds 10
-        # (Previous value of 1.2 would result in 12, breaking your limit)
-        params["amplitudeZ"] = intensity * 1.0   # Max 10
-        params["amplitudeX"] = 0.0
+        elif style == "Zoom":
+            # Rapid magnification
+            params["amplitudeZ"] = intensity * 1.0   
+            params["amplitudeX"] = 0.0
             
         animation_correlation_id = str(uuid.uuid4())
 

@@ -176,32 +176,29 @@ async def generate_3d(
         intensity = safe_depth
         
         # Initialize all params to 0
-        params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
+    params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
 
-        if style == "Orbit":
-            # Circular motion (X + Y sine/cosine)
-            params["amplitudeX"] = intensity
-            params["amplitudeY"] = intensity * 0.5
-            params["phaseY"] = 0.25 # Creates the circular offset
-            
-        elif style == "Dolly":
-            # UPDATED: Changed from Z to X/Y mix (Slider/Truck effect)
-            # This makes it distinct from 'Zoom'. It moves side-to-side (Truck) 
-            # with a tiny bit of forward movement to create a 3D parallax 'slider' look.
-            params["amplitudeX"] = intensity * 0.8  # Primary movement is Horizontal (Slider)
-            params["amplitudeZ"] = intensity * 0.2  # Slight depth push for 3D feel
-            params["phaseX"] = 0.0
+    if style == "Orbit":
+        # Moves in a circle/oval around the subject
+        # Uses X and Y with a phase offset to create rotation
+        params["amplitudeX"] = intensity * 1.0   # Max 10 (Full width)
+        params["amplitudeY"] = intensity * 0.5   # Max 5  (Half height for cinematic oval)
+        params["phaseX"] = 0.0
+        params["phaseY"] = 0.25                  # 0.25 offset creates the circular "orbit" motion
 
-        elif style == "Zoom":
-            # Pure Z-axis movement (In/Out)
-            params["amplitudeZ"] = intensity * 1.2 
-            
-        # Removed "Horizontal" block as requested
+    elif style == "Dolly":
+        # Moves physically Forward/Backward
+        # Swapped from X (Truck) to Z (True Dolly)
+        params["amplitudeX"] = 0.1
+        params["amplitudeZ"] = intensity * 0.9   # Max 10 (Full depth movement)
+        params["phaseX"] = 0.0
 
-        # Safety Cap (Immersity API usually limits amplitude to 10.0)
-        for key in ["amplitudeX", "amplitudeY", "amplitudeZ"]:
-            if params[key] > 10.0:
-                params[key] = 10.0
+    elif style == "Zoom":
+        # Rapid magnification
+        # FIX: Capped at 1.0 to ensure result never exceeds 10
+        # (Previous value of 1.2 would result in 12, breaking your limit)
+        params["amplitudeZ"] = intensity * 1.0   # Max 10
+        params["amplitudeX"] = 0.0
             
         animation_correlation_id = str(uuid.uuid4())
 

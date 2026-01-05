@@ -187,7 +187,7 @@ async def generate_3d(
             # Moves physically Forward/Backward
             # UPDATED: Changed fixed '0.1' to 'intensity * 0.1' for dynamic drift
             params["amplitudeX"] = intensity * 0.3
-            params["amplitudeZ"] = intensity * 1.0
+            params["amplitudeZ"] = intensity * 0.7
             params["phaseX"] = 0.5                   # 0.5 offset = "Push-Pull" tension
             params["amplitudeY"] = 0.0
 

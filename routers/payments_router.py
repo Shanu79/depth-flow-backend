@@ -53,7 +53,6 @@ async def create_checkout_session(
 ):
     """
     Handles both New Subscriptions (Checkout URL) and Plan Changes (Direct Update).
-    The DB is NOT updated here; we wait for the webhook.
     """
     # 1. Validate Plan
     cycle_data = PLAN_CONFIG.get(request.billing_cycle)
@@ -71,12 +70,11 @@ async def create_checkout_session(
         # --- SCENARIO A: UPGRADE / DOWNGRADE (Active Subscription) ---
         if current_user.subscription_id and current_user.subscription_status == "active":
             
-            # Use direct API update logic
-            client.subscriptions.update(
+            client.subscriptions.change_plan(
                 subscription_id=current_user.subscription_id,
                 product_id=target_product_id,
-                payment_frequency=request.billing_cycle, 
-                proration_behavior="prorated_immediately"
+                proration_billing_mode="prorated_immediately",
+                quantity=request.quantity
             )
             
             # Return distinct response so Frontend knows NO redirect is needed
@@ -89,7 +87,10 @@ async def create_checkout_session(
         # --- SCENARIO B: NEW SUBSCRIPTION (No Active Sub) ---
         else:
             session = client.checkout_sessions.create(
-                product_cart=[{"product_id": target_product_id, "quantity": request.quantity}],
+                product_cart=[{
+                    "product_id": target_product_id, 
+                    "quantity": request.quantity
+                }],
                 customer={
                     "email": current_user.email,
                     "name": current_user.full_name or "User"
@@ -110,7 +111,6 @@ async def create_checkout_session(
 
     except Exception as e:
         logger.error(f"Payment/Upgrade Error: {e}")
-        # Pass the specific Dodo error message to frontend if possible
         raise HTTPException(status_code=400, detail=f"Payment Error: {str(e)}")
 
 

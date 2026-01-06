@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # --- NEW IMPORTS ---
 from database import get_db
 from models import User
-from schemas import UserCreate, UserLogin  # <--- Import Schemas
+from schemas import UserCreate, UserLogin, UserResponse  # <--- Import Schemas
 from auth import (
     create_access_token, 
     get_current_user, 
@@ -174,16 +174,6 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
 async def logout():
     return {"message": "Logged out successfully"}
 
-@router.get("/me")
-def read_users_me(current_user: User = Depends(get_current_user)):
-    return {
-        "id": current_user.id,
-        "email": current_user.email,
-        "full_name": current_user.full_name,
-        "credits": current_user.credits,
-        "profile_pic": current_user.profile_pic,
-        "plan": current_user.plan,
-        "is_admin": current_user.is_admin,
-        "subscription_status": current_user.subscription_status,
-        "billing_cycle": current_user.billing_cycle
-    }
+@router.get("/me", response_model=UserResponse) # <--- MUST match the class above
+async def read_users_me(current_user: User = Depends(get_current_user)):
+    return current_user

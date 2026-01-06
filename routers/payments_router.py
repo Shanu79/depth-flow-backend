@@ -1,7 +1,6 @@
 import os
 import logging
-import requests 
-from fastapi import APIRouter, HTTPException, Depends, Header, Request
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional
 from dodopayments import DodoPayments
@@ -12,30 +11,22 @@ from database import get_db
 from models import User
 from auth import get_current_user
 
-# --- 1. SETUP LOGGING ---
+# --- SETUP ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-router = APIRouter(
-    prefix="/payments",
-    tags=["payments"]
-)
+router = APIRouter(prefix="/payments", tags=["payments"])
 
-# --- 2. CONFIGURATION ---
 DODO_API_KEY = os.environ.get("DODO_PAYMENTS_API_KEY")
 WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-
-if not DODO_API_KEY or not WEBHOOK_SECRET:
-    logger.warning("CRITICAL: Dodo API Key or Webhook Secret is missing!")
 
 client = DodoPayments(
     bearer_token=DODO_API_KEY,
     environment="live_mode" 
 )
 
-DODO_API_URL = "https://api.dodopayments.com/v1" 
-
+# Configuration mapping
 PLAN_CONFIG = {
     "monthly": {
         "Basic": {"id": "pdt_0NUQxXnGKlkhrpGBAFMvy", "credits": 550},
@@ -54,103 +45,101 @@ class CheckoutRequest(BaseModel):
     billing_cycle: str
     quantity: int = 1
 
-# --- HELPER: CANCELLATION LOGIC ---
-def cancel_dodo_subscription_raw(subscription_id: str):
-    """
-    Cancels a subscription using the raw Dodo API.
-    """
-    try:
-        url = f"{DODO_API_URL}/subscriptions/{subscription_id}/cancel"
-        headers = {
-            "Authorization": f"Bearer {DODO_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        response = requests.post(url, headers=headers)
-        
-        if response.status_code == 200:
-            return True
-        elif response.status_code == 404:
-            return True 
-        
-        # Raise error for unexpected failures
-        response.raise_for_status()
-        return True
-    except Exception as e:
-        logger.error(f"Raw API Cancel failed: {e}")
-        # We don't raise here to allow local DB cleanup to proceed
-        pass
-
-# --- 3. ENDPOINTS ---
-
+# --- 1. UNIFIED CHECKOUT & UPGRADE ENDPOINT ---
 @router.post("/create-checkout-session")
 async def create_checkout_session(
     request: CheckoutRequest, 
     current_user: User = Depends(get_current_user)
 ):
+    """
+    Handles both New Subscriptions (Checkout URL) and Plan Changes (Direct Update).
+    The DB is NOT updated here; we wait for the webhook.
+    """
+    # 1. Validate Plan
+    cycle_data = PLAN_CONFIG.get(request.billing_cycle)
+    if not cycle_data:
+        raise HTTPException(status_code=400, detail="Invalid billing cycle")
+
+    plan_data = cycle_data.get(request.plan_name)
+    if not plan_data:
+        raise HTTPException(status_code=400, detail=f"Invalid plan: {request.plan_name}")
+
+    target_product_id = plan_data["id"]
+    credits_to_add = plan_data["credits"]
+
     try:
-        cycle_data = PLAN_CONFIG.get(request.billing_cycle)
-        if not cycle_data:
-            raise HTTPException(status_code=400, detail="Invalid billing cycle")
+        # --- SCENARIO A: UPGRADE / DOWNGRADE (Active Subscription) ---
+        if current_user.subscription_id and current_user.subscription_status == "active":
+            
+            # Use direct API update logic
+            client.subscriptions.update(
+                subscription_id=current_user.subscription_id,
+                product_id=target_product_id,
+                payment_frequency=request.billing_cycle, 
+                proration_behavior="prorated_immediately"
+            )
+            
+            # Return distinct response so Frontend knows NO redirect is needed
+            return {
+                "action": "updated",
+                "message": f"Plan upgraded to {request.plan_name}. Changes will reflect shortly.",
+                "checkout_url": None
+            }
 
-        plan_data = cycle_data.get(request.plan_name)
-        if not plan_data:
-            raise HTTPException(status_code=400, detail=f"Invalid plan: {request.plan_name}")
-
-        product_id = plan_data["id"]
-        credits_to_add = plan_data["credits"]
-
-        session = client.checkout_sessions.create(
-            product_cart=[{
-                "product_id": product_id,
-                "quantity": request.quantity
-            }],
-            customer={
-                "email": current_user.email,
-                "name": current_user.full_name or "User"
-            },
-            metadata={
-                "user_id": str(current_user.id),
-                "credits_to_add": str(credits_to_add),
-                "plan_name": request.plan_name,
-                "billing_cycle": request.billing_cycle
-            },
-            return_url=f"{FRONTEND_URL}/workspace", 
-        )
-        
-        return {"checkout_url": session.checkout_url}
+        # --- SCENARIO B: NEW SUBSCRIPTION (No Active Sub) ---
+        else:
+            session = client.checkout_sessions.create(
+                product_cart=[{"product_id": target_product_id, "quantity": request.quantity}],
+                customer={
+                    "email": current_user.email,
+                    "name": current_user.full_name or "User"
+                },
+                metadata={
+                    "user_id": str(current_user.id),
+                    "credits_to_add": str(credits_to_add),
+                    "plan_name": request.plan_name,
+                    "billing_cycle": request.billing_cycle
+                },
+                return_url=f"{FRONTEND_URL}/workspace", 
+            )
+            
+            return {
+                "action": "checkout",
+                "checkout_url": session.checkout_url
+            }
 
     except Exception as e:
-        logger.error(f"Payment Init Error: {e}")
-        raise HTTPException(status_code=400, detail=f"Payment Gateway Error: {str(e)}")
+        logger.error(f"Payment/Upgrade Error: {e}")
+        # Pass the specific Dodo error message to frontend if possible
+        raise HTTPException(status_code=400, detail=f"Payment Error: {str(e)}")
 
 
+# --- 2. CANCEL SUBSCRIPTION ---
 @router.post("/cancel-subscription")
 async def cancel_subscription(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user)
 ):
+    """
+    Initiates cancellation via API. 
+    DB is NOT updated here; we wait for 'subscription.cancelled' webhook.
+    """
     if not current_user.subscription_id:
         raise HTTPException(status_code=400, detail="No active subscription found.")
 
     try:
-        # 1. Call Dodo API
-        cancel_dodo_subscription_raw(current_user.subscription_id)
-
-        # 2. Update Local Database
-        current_user.subscription_status = "canceled"
-        current_user.subscription_id = None 
-        current_user.billing_cycle = None 
+        # Just Trigger the API Call
+        client.subscriptions.cancel(
+            subscription_id=current_user.subscription_id
+        )
         
-        db.commit()
-
-        return {"status": "success", "message": "Subscription cancelled successfully."}
+        return {"status": "success", "message": "Cancellation initiated. It will be processed shortly."}
 
     except Exception as e:
-        logger.error(f"Cancellation Failed: {e}")
+        logger.error(f"Cancellation API Failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to cancel: {str(e)}")
 
 
+# --- 3. WEBHOOK (THE SOURCE OF TRUTH) ---
 @router.post("/webhook")
 async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
     try:
@@ -162,8 +151,7 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         try:
             wh = StandardWebhook(WEBHOOK_SECRET)
             wh.verify(payload_str, headers)
-        except Exception as e:
-            logger.error(f"Webhook Signature Verification Failed: {e}")
+        except Exception:
             raise HTTPException(status_code=400, detail="Invalid signature")
 
         # 2. Parse Event
@@ -173,58 +161,96 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         
         logger.info(f"Webhook Event: {event_type}")
 
-        # --- EVENT: PAYMENT SUCCEEDED ---
+        # --- HANDLER 1: NEW SUBSCRIPTION SUCCESS ---
         if event_type == "payment.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
-            plan_name = metadata.get("plan_name")
-            billing_cycle = metadata.get("billing_cycle")
-            new_subscription_id = data.get("subscription_id")
-            credits = int(metadata.get("credits_to_add", 0))
-
+            
+            # User Lookup
             user = None
             if user_id:
                 user = db.query(User).filter(User.id == int(user_id)).first()
-            if not user and new_subscription_id:
-                user = db.query(User).filter(User.subscription_id == new_subscription_id).first()
             if not user: 
                  email = data.get("customer", {}).get("email")
                  if email: user = db.query(User).filter(User.email == email).first()
 
             if user:
-                # Upgrade Logic: Cancel old sub if ID changed
-                if user.subscription_id and new_subscription_id and user.subscription_id != new_subscription_id:
-                    cancel_dodo_subscription_raw(user.subscription_id)
-
-                if credits > 0:
-                    user.credits += credits
+                new_sub_id = data.get("subscription_id")
+                is_renewal = user.subscription_id == new_sub_id
                 
-                if new_subscription_id:
-                    user.subscription_id = new_subscription_id
+                # Logic: Credits
+                credits_to_add = 0
+                if "credits_to_add" in metadata:
+                    # Case: New Checkout or Metadata preserved
+                    credits_to_add = int(metadata.get("credits_to_add"))
+                elif is_renewal:
+                    # Case: Auto-renewal (metadata might be empty) -> Look up from Config
+                    current_cycle = PLAN_CONFIG.get(user.billing_cycle, {})
+                    current_plan = current_cycle.get(user.plan, {})
+                    credits_to_add = current_plan.get("credits", 0)
+
+                # Commit Updates
+                if credits_to_add > 0:
+                    user.credits += credits_to_add
+
+                if new_sub_id:
+                    user.subscription_id = new_sub_id
                     user.subscription_status = "active"
                 
-                if plan_name: user.plan = plan_name
-                if billing_cycle: user.billing_cycle = billing_cycle
+                # Apply Plan details from metadata if available (New Sub)
+                if metadata.get("plan_name"): user.plan = metadata["plan_name"]
+                if metadata.get("billing_cycle"): user.billing_cycle = metadata["billing_cycle"]
 
                 db.commit()
+                logger.info(f"DB Updated: Payment Success for {user.email}")
 
-        # --- EVENT: SUBSCRIPTION CANCELLED ---
-        # Handles external cancellations or expirations
-        elif event_type == "subscription.cancelled":
-            subscription_id = data.get("subscription_id")
+
+        # --- HANDLER 2: PLAN UPGRADE/DOWNGRADE SUCCESS ---
+        elif event_type == "subscription.updated":
+            # This fires when create_checkout_session calls client.subscriptions.update()
+            sub_id = data.get("subscription_id")
+            product_id = data.get("product_id")
+            status = data.get("status")
+
+            user = db.query(User).filter(User.subscription_id == sub_id).first()
             
-            if subscription_id:
-                user = db.query(User).filter(User.subscription_id == subscription_id).first()
+            if user:
+                user.subscription_status = status
                 
-                if user:
+                # Sync Plan Name from Product ID
+                found_plan = False
+                for cycle, plans in PLAN_CONFIG.items():
+                    for p_name, p_data in plans.items():
+                        if p_data["id"] == product_id:
+                            user.plan = p_name
+                            user.billing_cycle = cycle
+                            
+                            # Optional: Handle prorated credits for upgrades here if needed
+                            # (Usually Dodo charges immediately -> triggers payment.succeeded -> adds credits there)
+                            
+                            found_plan = True
+                            break
+                    if found_plan: break
+                
+                db.commit()
+                logger.info(f"DB Updated: Sub Updated for {user.email}")
+
+
+        # --- HANDLER 3: CANCELLATION ---
+        elif event_type == "subscription.cancelled":
+            sub_id = data.get("subscription_id")
+            user = db.query(User).filter(User.subscription_id == sub_id).first()
+            
+            if user:
+                # Security Check: Ensure we aren't cancelling an old ID 
+                # (e.g. user had ID_1, upgraded to ID_2, then ID_1 cancelled event arrived late)
+                if user.subscription_id == sub_id:
                     user.subscription_status = "canceled"
                     user.plan = "Free"
                     user.subscription_id = None
                     user.billing_cycle = None
                     db.commit()
-                    logger.info(f"Subscription {subscription_id} cancelled via Webhook for {user.email}")
-                else:
-                    logger.warning(f"Received cancel webhook for unknown subscription: {subscription_id}")
+                    logger.info(f"DB Updated: Sub Cancelled for {user.email}")
 
         return {"status": "received"}
 

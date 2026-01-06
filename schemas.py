@@ -27,6 +27,8 @@ class UserResponse(BaseModel):
     # Critical for Admin Panel
     is_admin: bool = False 
     subscription_status: Optional[str] = "inactive"
+    
+    subscription_id: Optional[str] = None
 
     # Pydantic V2 Configuration
     model_config = ConfigDict(from_attributes=True)

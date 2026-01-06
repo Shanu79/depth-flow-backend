@@ -305,68 +305,79 @@ async def sync_subscription(
     db: Session = Depends(get_db)
 ):
     """
-    Force-syncs the local database with Dodo Payments.
-    Call this when the user visits the billing page or reports an issue.
+    Force-syncs local DB with Dodo. Includes Debug Logging.
     """
     if not current_user.subscription_id:
         return {"status": "ignored", "message": "No active subscription to sync."}
 
     try:
-        # 1. Fetch the REAL status from Dodo
-        # We use .retrieve() (or .get() depending on exact SDK version)
+        # 1. Fetch REAL status from Dodo
         dodo_sub = client.subscriptions.retrieve(
             subscription_id=current_user.subscription_id
         )
 
-        # 2. Map Dodo Data to Local Fields
-        real_status = dodo_sub.status  # e.g., 'active', 'on_hold', 'cancelled'
+        # --- DEBUG LOGGING START ---
+        logger.info(f"SYNC DEBUG: Fetching Sub {current_user.subscription_id}")
+        logger.info(f"SYNC DEBUG: Dodo Status: {dodo_sub.status}")
+        logger.info(f"SYNC DEBUG: Dodo Product ID: {dodo_sub.product_id}")
+        # --- DEBUG LOGGING END ---
+
+        # 2. Status Logic
+        real_status = dodo_sub.status 
         real_product_id = dodo_sub.product_id
         
-        # Check for "Scheduled Cancellation" logic
-        # If Dodo says active but 'cancel_at_period_end' is true
-        is_scheduled_cancel = getattr(dodo_sub, 'cancel_at_next_billing_date', False)
-        
-        # 3. Determine the Status String
+        # Check for scheduled cancellation
+        # We check multiple attribute names just in case the SDK version differs
+        is_scheduled_cancel = getattr(dodo_sub, 'cancel_at_next_billing_date', False) or \
+                              getattr(dodo_sub, 'cancel_at_period_end', False)
+
         if real_status == "active" and is_scheduled_cancel:
-            # Reconstruct the "Scheduled for..." string
             next_date = getattr(dodo_sub, 'next_billing_date', None)
             fmt_date = str(next_date)[:10] if next_date else "soon"
             final_status = f"Scheduled for cancellation on {fmt_date}"
         else:
             final_status = real_status
 
-        # 4. Update Database
-        current_user.subscription_status = final_status
-        
-        # Sync Plan (Reverse Lookup ID -> Name)
-        # This fixes cases where a user upgraded but DB didn't update
+        # 3. Apply Updates
+        # We explicitly verify if data changed before logging
+        if current_user.subscription_status != final_status:
+             logger.info(f"SYNC UPDATE: Status changing from {current_user.subscription_status} to {final_status}")
+             current_user.subscription_status = final_status
+
+        # 4. Sync Plan (Critical Step)
         found_plan = False
         for cycle, plans in PLAN_CONFIG.items():
             for p_name, p_data in plans.items():
-                if p_data["id"] == real_product_id:
-                    current_user.plan = p_name
-                    current_user.billing_cycle = cycle
+                # Compare IDs safely
+                if str(p_data["id"]) == str(real_product_id):
+                    if current_user.plan != p_name:
+                        logger.info(f"SYNC UPDATE: Plan changing from {current_user.plan} to {p_name}")
+                        current_user.plan = p_name
+                        current_user.billing_cycle = cycle
                     found_plan = True
                     break
             if found_plan: break
-            
+        
+        if not found_plan:
+            logger.warning(f"SYNC WARNING: Product ID {real_product_id} from Dodo NOT FOUND in local PLAN_CONFIG. Plan not updated.")
+
+        # 5. Force DB Save
+        db.add(current_user) # Re-attach to session to be safe
         db.commit()
-        logger.info(f"Synced User {current_user.id}: Status {final_status}, Plan {current_user.plan}")
+        db.refresh(current_user) # Reload from DB to confirm save
 
         return {
             "status": "success", 
             "message": "Subscription synced successfully.",
-            "synced_status": final_status,
+            "synced_status": current_user.subscription_status,
             "synced_plan": current_user.plan
         }
 
     except Exception as e:
         logger.error(f"Sync Failed: {e}")
-        # If Dodo returns 404, it means the sub is deleted. Handle that:
         if "404" in str(e):
              current_user.subscription_status = "canceled"
              current_user.subscription_id = None
              db.commit()
              return {"status": "success", "message": "Subscription was deleted remotely."}
-             
         raise HTTPException(status_code=500, detail="Failed to sync subscription.")

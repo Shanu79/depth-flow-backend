@@ -324,11 +324,6 @@ async def sync_subscription(
             subscription_id=user_db.subscription_id
         )
 
-        # --- DEBUG PRINTS (Visible in your Terminal) ---
-        print(f"--- SYNC START for User {user_db.email} ---")
-        print(f"Dodo Status: {dodo_sub.status}")
-        print(f"Dodo Product ID: {dodo_sub.product_id}")
-
         # 3. Determine Status
         real_status = dodo_sub.status 
         real_product_id = dodo_sub.product_id
@@ -346,7 +341,6 @@ async def sync_subscription(
 
         # 4. Apply Status Update
         if user_db.subscription_status != final_status:
-             print(f"UPDATING STATUS: {user_db.subscription_status} -> {final_status}")
              user_db.subscription_status = final_status
 
         # 5. Apply Plan Update (Reverse Lookup)
@@ -373,8 +367,6 @@ async def sync_subscription(
         db.add(user_db)
         db.commit()
         db.refresh(user_db) # Reload to confirm
-        
-        print(f"--- SYNC COMPLETE. DB Plan: {user_db.plan}, Status: {user_db.subscription_status} ---")
 
         return {
             "status": "success", 

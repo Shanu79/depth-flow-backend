@@ -297,3 +297,76 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Webhook Error: {e}")
         return {"status": "error", "detail": str(e)}
+    
+
+@router.post("/sync-subscription")
+async def sync_subscription(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Force-syncs the local database with Dodo Payments.
+    Call this when the user visits the billing page or reports an issue.
+    """
+    if not current_user.subscription_id:
+        return {"status": "ignored", "message": "No active subscription to sync."}
+
+    try:
+        # 1. Fetch the REAL status from Dodo
+        # We use .retrieve() (or .get() depending on exact SDK version)
+        dodo_sub = client.subscriptions.retrieve(
+            subscription_id=current_user.subscription_id
+        )
+
+        # 2. Map Dodo Data to Local Fields
+        real_status = dodo_sub.status  # e.g., 'active', 'on_hold', 'cancelled'
+        real_product_id = dodo_sub.product_id
+        
+        # Check for "Scheduled Cancellation" logic
+        # If Dodo says active but 'cancel_at_period_end' is true
+        is_scheduled_cancel = getattr(dodo_sub, 'cancel_at_next_billing_date', False)
+        
+        # 3. Determine the Status String
+        if real_status == "active" and is_scheduled_cancel:
+            # Reconstruct the "Scheduled for..." string
+            next_date = getattr(dodo_sub, 'next_billing_date', None)
+            fmt_date = str(next_date)[:10] if next_date else "soon"
+            final_status = f"Scheduled for cancellation on {fmt_date}"
+        else:
+            final_status = real_status
+
+        # 4. Update Database
+        current_user.subscription_status = final_status
+        
+        # Sync Plan (Reverse Lookup ID -> Name)
+        # This fixes cases where a user upgraded but DB didn't update
+        found_plan = False
+        for cycle, plans in PLAN_CONFIG.items():
+            for p_name, p_data in plans.items():
+                if p_data["id"] == real_product_id:
+                    current_user.plan = p_name
+                    current_user.billing_cycle = cycle
+                    found_plan = True
+                    break
+            if found_plan: break
+            
+        db.commit()
+        logger.info(f"Synced User {current_user.id}: Status {final_status}, Plan {current_user.plan}")
+
+        return {
+            "status": "success", 
+            "message": "Subscription synced successfully.",
+            "synced_status": final_status,
+            "synced_plan": current_user.plan
+        }
+
+    except Exception as e:
+        logger.error(f"Sync Failed: {e}")
+        # If Dodo returns 404, it means the sub is deleted. Handle that:
+        if "404" in str(e):
+             current_user.subscription_status = "canceled"
+             current_user.subscription_id = None
+             db.commit()
+             return {"status": "success", "message": "Subscription was deleted remotely."}
+             
+        raise HTTPException(status_code=500, detail="Failed to sync subscription.")

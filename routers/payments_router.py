@@ -305,29 +305,35 @@ async def sync_subscription(
     db: Session = Depends(get_db)
 ):
     """
-    Force-syncs local DB with Dodo. Includes Debug Logging.
+    Force-syncs local DB with Dodo.
+    Uses explicit DB re-fetching to ensure updates persist.
     """
     if not current_user.subscription_id:
         return {"status": "ignored", "message": "No active subscription to sync."}
 
+    # 1. CRITICAL FIX: Re-fetch user from the current DB session
+    # This ensures we are modifying the actual DB row, not a copy.
+    user_db = db.query(User).filter(User.id == current_user.id).first()
+    
+    if not user_db:
+        raise HTTPException(status_code=404, detail="User not found in DB")
+
     try:
-        # 1. Fetch REAL status from Dodo
+        # 2. Fetch REAL status from Dodo
         dodo_sub = client.subscriptions.retrieve(
-            subscription_id=current_user.subscription_id
+            subscription_id=user_db.subscription_id
         )
 
-        # --- DEBUG LOGGING START ---
-        logger.info(f"SYNC DEBUG: Fetching Sub {current_user.subscription_id}")
-        logger.info(f"SYNC DEBUG: Dodo Status: {dodo_sub.status}")
-        logger.info(f"SYNC DEBUG: Dodo Product ID: {dodo_sub.product_id}")
-        # --- DEBUG LOGGING END ---
+        # --- DEBUG PRINTS (Visible in your Terminal) ---
+        print(f"--- SYNC START for User {user_db.email} ---")
+        print(f"Dodo Status: {dodo_sub.status}")
+        print(f"Dodo Product ID: {dodo_sub.product_id}")
 
-        # 2. Status Logic
+        # 3. Determine Status
         real_status = dodo_sub.status 
         real_product_id = dodo_sub.product_id
         
         # Check for scheduled cancellation
-        # We check multiple attribute names just in case the SDK version differs
         is_scheduled_cancel = getattr(dodo_sub, 'cancel_at_next_billing_date', False) or \
                               getattr(dodo_sub, 'cancel_at_period_end', False)
 
@@ -338,46 +344,52 @@ async def sync_subscription(
         else:
             final_status = real_status
 
-        # 3. Apply Updates
-        # We explicitly verify if data changed before logging
-        if current_user.subscription_status != final_status:
-             logger.info(f"SYNC UPDATE: Status changing from {current_user.subscription_status} to {final_status}")
-             current_user.subscription_status = final_status
+        # 4. Apply Status Update
+        if user_db.subscription_status != final_status:
+             print(f"UPDATING STATUS: {user_db.subscription_status} -> {final_status}")
+             user_db.subscription_status = final_status
 
-        # 4. Sync Plan (Critical Step)
+        # 5. Apply Plan Update (Reverse Lookup)
         found_plan = False
         for cycle, plans in PLAN_CONFIG.items():
             for p_name, p_data in plans.items():
-                # Compare IDs safely
-                if str(p_data["id"]) == str(real_product_id):
-                    if current_user.plan != p_name:
-                        logger.info(f"SYNC UPDATE: Plan changing from {current_user.plan} to {p_name}")
-                        current_user.plan = p_name
-                        current_user.billing_cycle = cycle
+                # Compare IDs safely (strip whitespace just in case)
+                config_id = str(p_data["id"]).strip()
+                remote_id = str(real_product_id).strip()
+                
+                if config_id == remote_id:
+                    if user_db.plan != p_name:
+                        print(f"UPDATING PLAN: {user_db.plan} -> {p_name}")
+                        user_db.plan = p_name
+                        user_db.billing_cycle = cycle
                     found_plan = True
                     break
             if found_plan: break
         
         if not found_plan:
-            logger.warning(f"SYNC WARNING: Product ID {real_product_id} from Dodo NOT FOUND in local PLAN_CONFIG. Plan not updated.")
+            print(f"WARNING: Product ID {real_product_id} not found in PLAN_CONFIG.")
 
-        # 5. Force DB Save
-        db.add(current_user) # Re-attach to session to be safe
+        # 6. Force Save
+        db.add(user_db)
         db.commit()
-        db.refresh(current_user) # Reload from DB to confirm save
+        db.refresh(user_db) # Reload to confirm
+        
+        print(f"--- SYNC COMPLETE. DB Plan: {user_db.plan}, Status: {user_db.subscription_status} ---")
 
         return {
             "status": "success", 
             "message": "Subscription synced successfully.",
-            "synced_status": current_user.subscription_status,
-            "synced_plan": current_user.plan
+            "synced_status": user_db.subscription_status,
+            "synced_plan": user_db.plan
         }
 
     except Exception as e:
+        print(f"SYNC ERROR: {e}")
         logger.error(f"Sync Failed: {e}")
+        # Handle remote deletion
         if "404" in str(e):
-             current_user.subscription_status = "canceled"
-             current_user.subscription_id = None
+             user_db.subscription_status = "canceled"
+             user_db.subscription_id = None
              db.commit()
              return {"status": "success", "message": "Subscription was deleted remotely."}
         raise HTTPException(status_code=500, detail="Failed to sync subscription.")

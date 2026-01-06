@@ -23,13 +23,12 @@ DODO_API_KEY = os.environ.get("DODO_PAYMENTS_API_KEY")
 WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
-# Initialize Dodo Client
 client = DodoPayments(
     bearer_token=DODO_API_KEY,
     environment="live_mode" 
 )
 
-# Plan Configuration (Single Source of Truth)
+# SINGLE SOURCE OF TRUTH FOR CREDITS
 PLAN_CONFIG = {
     "monthly": {
         "Basic": {"id": "pdt_0NUQxXnGKlkhrpGBAFMvy", "credits": 550},
@@ -53,13 +52,9 @@ class CheckoutRequest(BaseModel):
 @router.post("/create-checkout-session")
 async def create_checkout_session(
     request: CheckoutRequest, 
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
-    """
-    Unified endpoint:
-    - If user has NO active subscription -> Returns Checkout URL (New Sub).
-    - If user HAS active (or pending cancel) subscription -> Upgrades/Downgrades instantly.
-    """
     # 1. Validate Plan
     cycle_data = PLAN_CONFIG.get(request.billing_cycle)
     if not cycle_data:
@@ -72,7 +67,6 @@ async def create_checkout_session(
     target_product_id = plan_data["id"]
 
     # --- STATUS CHECK LOGIC ---
-    # We treat "Scheduled for cancellation..." as a valid state to modify the plan
     current_status = current_user.subscription_status or ""
     has_active_sub = current_user.subscription_id and (
         current_status == "active" or "Scheduled for cancellation" in current_status
@@ -82,38 +76,43 @@ async def create_checkout_session(
         # --- SCENARIO A: UPGRADE / DOWNGRADE / REACTIVATE ---
         if has_active_sub:
             
-            # 1. If they were scheduled to cancel, we MUST Reactivate (Un-cancel) first
+            # 1. Reactivate if needed
             if "Scheduled for cancellation" in current_status:
                 try:
                     client.subscriptions.update(
                         subscription_id=current_user.subscription_id,
-                        cancel_at_next_billing_date=False  # <--- Reactivates auto-renewal
+                        cancel_at_next_billing_date=False 
                     )
-                    logger.info(f"Reactivated subscription {current_user.subscription_id} for user {current_user.id}")
-                except Exception as e:
-                    logger.warning(f"Failed to explicit reactivate (might happen automatically on plan change): {e}")
+                except Exception:
+                    pass 
 
-            # 2. Change Plan (Charges difference immediately)
-            # This works even if they are just switching plans while cancelling
-            client.subscriptions.change_plan(
+            # 2. Change Plan (Immediate Charge)
+            updated_sub = client.subscriptions.change_plan(
                 subscription_id=current_user.subscription_id,
                 product_id=target_product_id,
                 proration_billing_mode="prorated_immediately",
                 quantity=request.quantity
             )
             
-            # The Webhook ("subscription.updated") will fire shortly and 
-            # update the DB status back to "active" automatically.
+            # 3. IMMEDIATE DB UPDATE (Vital for UI Sync)
+            current_user.plan = request.plan_name
+            current_user.billing_cycle = request.billing_cycle
+            current_user.subscription_status = "active"
+            
+            next_date = getattr(updated_sub, 'next_billing_date', None)
+            formatted_date = str(next_date)[:10] if next_date else "next billing cycle"
+
+            db.commit()
             
             return {
                 "action": "updated",
-                "message": f"Plan successfully changed to {request.plan_name}. Your subscription has been reactivated.",
+                "message": f"Plan upgraded to {request.plan_name}. Active now. Next billing: {formatted_date}",
                 "checkout_url": None
             }
 
-        # --- SCENARIO B: NEW SUBSCRIPTION (Truly No Sub) ---
+        # --- SCENARIO B: NEW SUBSCRIPTION ---
         else:
-            credits_to_add = plan_data["credits"] # Only needed for new subs here
+            credits_to_add = plan_data["credits"]
             
             session = client.checkout_sessions.create(
                 product_cart=[{
@@ -142,32 +141,25 @@ async def create_checkout_session(
         logger.error(f"Payment/Change Error: {e}")
         raise HTTPException(status_code=400, detail=f"Payment Error: {str(e)}")
 
+
 # --- 2. CANCEL SUBSCRIPTION ---
 @router.post("/cancel-subscription")
 async def cancel_subscription(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Schedules cancellation and updates DB status immediately.
-    """
     if not current_user.subscription_id:
         raise HTTPException(status_code=400, detail="No active subscription found.")
 
     try:
-        # 1. Update Dodo to stop auto-renewal
         updated_sub = client.subscriptions.update(
             subscription_id=current_user.subscription_id,
             cancel_at_next_billing_date=True
         )
         
-        # 2. Extract End Date
-        # Dodo usually returns 'next_billing_date' for the period end
         raw_date = getattr(updated_sub, 'next_billing_date', None)
         formatted_date = str(raw_date)[:10] if raw_date else datetime.now().strftime('%Y-%m-%d')
 
-        # 3. UPDATE DATABASE STATUS IMMEDIATELY
-        # As requested: "Scheduled for cancellation on [date]"
         new_status = f"Scheduled for cancellation on {formatted_date}"
         current_user.subscription_status = new_status
         db.commit()
@@ -182,11 +174,11 @@ async def cancel_subscription(
         logger.error(f"Cancellation API Failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to cancel: {str(e)}")
 
-# --- 3. WEBHOOK (The Source of Truth) ---
+
+# --- 3. WEBHOOK (Handles Credits for ALL Payments) ---
 @router.post("/webhook")
 async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
     try:
-        # 1. Verification
         payload_bytes = await request.body()
         payload_str = payload_bytes.decode("utf-8")
         headers = dict(request.headers)
@@ -197,19 +189,19 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid signature")
 
-        # 2. Parse Event
         payload = await request.json()
         event_type = payload.get("type")
         data = payload.get("data", {})
         
         logger.info(f"Webhook Event: {event_type}")
 
-        # --- A. PAYMENT SUCCEEDED (New Subs + Renewals) ---
+        # --- EVENT: PAYMENT SUCCEEDED ---
+        # This fires for: New Subs, Upgrades, AND Auto-Renewals
         if event_type == "payment.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
             
-            # User Lookup Strategy
+            # 1. Identify User
             user = None
             if user_id:
                 user = db.query(User).filter(User.id == int(user_id)).first()
@@ -219,36 +211,44 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
 
             if user:
                 new_sub_id = data.get("subscription_id")
+                # Check if it's a renewal (same Subscription ID)
                 is_renewal = user.subscription_id == new_sub_id
                 
-                # Credits Logic
+                # 2. Determine Credits to Add
                 credits_to_add = 0
+                source = "Unknown"
+
                 if "credits_to_add" in metadata:
-                    # Case 1: New Checkout (Metadata exists)
+                    # Case A: New Subscription (Metadata from Checkout)
                     credits_to_add = int(metadata.get("credits_to_add"))
+                    source = "Metadata (New Sub)"
                 elif is_renewal:
-                    # Case 2: Auto-renewal (No metadata) -> Look up from Config based on CURRENT plan
+                    # Case B: Auto-Renewal or Plan Change (No Metadata)
+                    # We look up the credits based on the user's CURRENT active plan in DB
                     current_cycle = PLAN_CONFIG.get(user.billing_cycle, {})
                     current_plan = current_cycle.get(user.plan, {})
                     credits_to_add = current_plan.get("credits", 0)
+                    source = f"Auto-Renewal ({user.plan})"
 
-                # Update User
+                # 3. Add Credits
                 if credits_to_add > 0:
                     user.credits += credits_to_add
+                    logger.info(f"ADDED {credits_to_add} CREDITS to User {user.email}. Source: {source}")
+                else:
+                    logger.warning(f"Payment succeeded but 0 credits added. User: {user.email}, Source: {source}")
 
+                # 4. Sync State
                 if new_sub_id:
                     user.subscription_id = new_sub_id
                     user.subscription_status = "active"
                 
-                # Update plan info if present (only on New/Upgrade checkouts)
+                # Apply metadata updates if present (only on New Subs)
                 if metadata.get("plan_name"): user.plan = metadata["plan_name"]
                 if metadata.get("billing_cycle"): user.billing_cycle = metadata["billing_cycle"]
 
                 db.commit()
-                logger.info(f"DB Updated: Payment Success for {user.email}")
 
-
-        # --- B. SUBSCRIPTION UPDATED (Upgrades/Downgrades) ---
+        # --- EVENT: SUBSCRIPTION UPDATED ---
         elif event_type == "subscription.updated":
             sub_id = data.get("subscription_id")
             product_id = data.get("product_id")
@@ -257,10 +257,9 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
             user = db.query(User).filter(User.subscription_id == sub_id).first()
             
             if user:
-                # Update Status
                 user.subscription_status = status
                 
-                # Sync Plan Name from Product ID (Reverse Lookup)
+                # Keep Plan in Sync
                 found_plan = False
                 for cycle, plans in PLAN_CONFIG.items():
                     for p_name, p_data in plans.items():
@@ -272,25 +271,18 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                     if found_plan: break
                 
                 db.commit()
-                logger.info(f"DB Updated: Plan Changed for {user.email}")
 
-
-        # --- C. SUBSCRIPTION CANCELLED (Final Termination) ---
+        # --- EVENT: SUBSCRIPTION CANCELLED ---
         elif event_type == "subscription.cancelled":
             sub_id = data.get("subscription_id")
             user = db.query(User).filter(User.subscription_id == sub_id).first()
             
-            if user:
-                # Race Condition Check:
-                # Only cancel if the ID in the webhook matches the user's CURRENT ID.
-                # This prevents cancelling a user who upgraded (got a new ID) but the old ID just expired.
-                if user.subscription_id == sub_id:
-                    user.subscription_status = "canceled"
-                    user.plan = "Free"
-                    user.subscription_id = None
-                    user.billing_cycle = None
-                    db.commit()
-                    logger.info(f"DB Updated: Subscription Cancelled for {user.email}")
+            if user and user.subscription_id == sub_id:
+                user.subscription_status = "canceled"
+                user.plan = "Free"
+                user.subscription_id = None
+                user.billing_cycle = None
+                db.commit()
 
         return {"status": "received"}
 

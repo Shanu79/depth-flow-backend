@@ -6,7 +6,7 @@ from typing import Optional
 from dodopayments import DodoPayments
 from sqlalchemy.orm import Session
 from standardwebhooks.webhooks import Webhook as StandardWebhook
-
+from datetime import datetime
 from database import get_db
 from models import User
 from auth import get_current_user
@@ -120,19 +120,35 @@ async def cancel_subscription(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Initiates cancellation via API. 
-    DB is NOT updated here; we wait for 'subscription.cancelled' webhook.
+    Schedules cancellation at the end of the billing cycle and returns the specific date.
     """
     if not current_user.subscription_id:
         raise HTTPException(status_code=400, detail="No active subscription found.")
 
     try:
-        # Just Trigger the API Call
-        client.subscriptions.cancel(
-            subscription_id=current_user.subscription_id
+        # 1. Update Dodo to stop auto-renewal
+        # Capture the returned subscription object
+        updated_sub = client.subscriptions.update(
+            subscription_id=current_user.subscription_id,
+            cancel_at_next_billing_date=True
         )
         
-        return {"status": "success", "message": "Cancellation initiated. It will be processed shortly."}
+        # 2. Extract the end date
+        # Note: adjust attribute name if Dodo returns 'next_payment_date' or similar
+        end_date = updated_sub.next_billing_date 
+        
+        # Format the date nicely if it's a datetime object, otherwise use as string
+        if isinstance(end_date, str):
+            formatted_date = end_date[:10] # Take YYYY-MM-DD if it's a long ISO string
+        else:
+            formatted_date = str(end_date)
+
+        # 3. Return the informative message
+        return {
+            "status": "success", 
+            "message": f"Subscription has been scheduled for cancellation. You will retain access until {formatted_date}.",
+            "end_date": formatted_date
+        }
 
     except Exception as e:
         logger.error(f"Cancellation API Failed: {e}")

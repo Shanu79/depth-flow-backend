@@ -58,7 +58,7 @@ async def create_checkout_session(
     """
     Unified endpoint:
     - If user has NO active subscription -> Returns Checkout URL (New Sub).
-    - If user HAS active subscription -> Upgrades/Downgrades instantly via API.
+    - If user HAS active (or pending cancel) subscription -> Upgrades/Downgrades instantly.
     """
     # 1. Validate Plan
     cycle_data = PLAN_CONFIG.get(request.billing_cycle)
@@ -70,30 +70,51 @@ async def create_checkout_session(
         raise HTTPException(status_code=400, detail=f"Invalid plan: {request.plan_name}")
 
     target_product_id = plan_data["id"]
-    credits_to_add = plan_data["credits"]
+
+    # --- STATUS CHECK LOGIC ---
+    # We treat "Scheduled for cancellation..." as a valid state to modify the plan
+    current_status = current_user.subscription_status or ""
+    has_active_sub = current_user.subscription_id and (
+        current_status == "active" or "Scheduled for cancellation" in current_status
+    )
 
     try:
-        # --- SCENARIO A: UPGRADE / DOWNGRADE (Active Subscription) ---
-        if current_user.subscription_id and current_user.subscription_status == "active":
+        # --- SCENARIO A: UPGRADE / DOWNGRADE / REACTIVATE ---
+        if has_active_sub:
             
-            # Use 'change_plan' for both Upgrades and Downgrades
-            # This calculates the difference immediately.
+            # 1. If they were scheduled to cancel, we MUST Reactivate (Un-cancel) first
+            if "Scheduled for cancellation" in current_status:
+                try:
+                    client.subscriptions.update(
+                        subscription_id=current_user.subscription_id,
+                        cancel_at_next_billing_date=False  # <--- Reactivates auto-renewal
+                    )
+                    logger.info(f"Reactivated subscription {current_user.subscription_id} for user {current_user.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to explicit reactivate (might happen automatically on plan change): {e}")
+
+            # 2. Change Plan (Charges difference immediately)
+            # This works even if they are just switching plans while cancelling
             client.subscriptions.change_plan(
                 subscription_id=current_user.subscription_id,
                 product_id=target_product_id,
-                proration_billing_mode="prorated_immediately", # Charges difference now
+                proration_billing_mode="prorated_immediately",
                 quantity=request.quantity
             )
             
-            # Return distinct response so Frontend knows NO redirect is needed
+            # The Webhook ("subscription.updated") will fire shortly and 
+            # update the DB status back to "active" automatically.
+            
             return {
                 "action": "updated",
-                "message": f"Plan successfully changed to {request.plan_name}. Updates will reflect shortly.",
+                "message": f"Plan successfully changed to {request.plan_name}. Your subscription has been reactivated.",
                 "checkout_url": None
             }
 
-        # --- SCENARIO B: NEW SUBSCRIPTION (No Active Sub) ---
+        # --- SCENARIO B: NEW SUBSCRIPTION (Truly No Sub) ---
         else:
+            credits_to_add = plan_data["credits"] # Only needed for new subs here
+            
             session = client.checkout_sessions.create(
                 product_cart=[{
                     "product_id": target_product_id, 
@@ -119,9 +140,7 @@ async def create_checkout_session(
 
     except Exception as e:
         logger.error(f"Payment/Change Error: {e}")
-        # Return Dodo's specific error message if possible
         raise HTTPException(status_code=400, detail=f"Payment Error: {str(e)}")
-
 
 # --- 2. CANCEL SUBSCRIPTION ---
 @router.post("/cancel-subscription")

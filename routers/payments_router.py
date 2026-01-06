@@ -66,7 +66,7 @@ async def create_checkout_session(
 
     target_product_id = plan_data["id"]
 
-    # --- STATUS CHECK LOGIC ---
+    # ... Status Check Logic (Same as before) ...
     current_status = current_user.subscription_status or ""
     has_active_sub = current_user.subscription_id and (
         current_status == "active" or "Scheduled for cancellation" in current_status
@@ -86,15 +86,27 @@ async def create_checkout_session(
                 except Exception:
                     pass 
 
-            # 2. Change Plan (Immediate Charge)
-            updated_sub = client.subscriptions.change_plan(
-                subscription_id=current_user.subscription_id,
-                product_id=target_product_id,
-                proration_billing_mode="prorated_immediately",
-                quantity=request.quantity
-            )
-            
-            # 3. IMMEDIATE DB UPDATE (Vital for UI Sync)
+            # 2. Change Plan (Wrapped in specific Error Handling)
+            try:
+                updated_sub = client.subscriptions.change_plan(
+                    subscription_id=current_user.subscription_id,
+                    product_id=target_product_id,
+                    proration_billing_mode="prorated_immediately",
+                    quantity=request.quantity
+                )
+            except Exception as e:
+                # --- NEW: Handle Pending Payment Lock ---
+                error_str = str(e)
+                if "PREVIOUS_PAYMENT_PENDING" in error_str or "409" in error_str:
+                    logger.warning(f"409 Error for user {current_user.id}: Pending Payment")
+                    raise HTTPException(
+                        status_code=409, 
+                        detail="A previous payment is currently processing. Please wait a few minutes for it to settle before changing plans."
+                    )
+                else:
+                    raise e # Re-raise other errors to be caught by the outer block
+
+            # 3. IMMEDIATE DB UPDATE
             current_user.plan = request.plan_name
             current_user.billing_cycle = request.billing_cycle
             current_user.subscription_status = "active"
@@ -110,10 +122,9 @@ async def create_checkout_session(
                 "checkout_url": None
             }
 
-        # --- SCENARIO B: NEW SUBSCRIPTION ---
+        # --- SCENARIO B: NEW SUBSCRIPTION (Same as before) ---
         else:
             credits_to_add = plan_data["credits"]
-            
             session = client.checkout_sessions.create(
                 product_cart=[{
                     "product_id": target_product_id, 
@@ -131,16 +142,13 @@ async def create_checkout_session(
                 },
                 return_url=f"{FRONTEND_URL}/workspace", 
             )
-            
-            return {
-                "action": "checkout",
-                "checkout_url": session.checkout_url
-            }
+            return {"action": "checkout", "checkout_url": session.checkout_url}
 
+    except HTTPException as he:
+        raise he # Pass through our custom HTTPExceptions
     except Exception as e:
         logger.error(f"Payment/Change Error: {e}")
         raise HTTPException(status_code=400, detail=f"Payment Error: {str(e)}")
-
 
 # --- 2. CANCEL SUBSCRIPTION ---
 @router.post("/cancel-subscription")

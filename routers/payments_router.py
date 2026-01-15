@@ -240,7 +240,7 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
 
                 # 3. Add Credits
                 if credits_to_add > 0:
-                    user.credits += credits_to_add
+                    user.credits = credits_to_add
                     logger.info(f"ADDED {credits_to_add} CREDITS to User {user.email}. Source: {source}")
                 else:
                     logger.warning(f"Payment succeeded but 0 credits added. User: {user.email}, Source: {source}")

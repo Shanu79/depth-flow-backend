@@ -286,10 +286,19 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
             user = db.query(User).filter(User.subscription_id == sub_id).first()
             
             if user and user.subscription_id == sub_id:
-                user.subscription_status = "canceled"
+                logger.info(f"Subscription expired for User {user.email}. Zeroing credits.")
+                
+                # 1. Update Status
+                user.subscription_status = "cancelled"
                 user.plan = "Free"
+                
+                # 2. ZERO OUT CREDITS (The Requirement)
+                user.credits = 0 
+                
+                # 3. Cleanup IDs
                 user.subscription_id = None
                 user.billing_cycle = None
+                
                 db.commit()
 
         return {"status": "received"}
@@ -331,6 +340,16 @@ async def sync_subscription(
         # Check for scheduled cancellation
         is_scheduled_cancel = getattr(dodo_sub, 'cancel_at_next_billing_date', False) or \
                               getattr(dodo_sub, 'cancel_at_period_end', False)
+                              
+        if real_status in ["cancelled", "expired", "past_due"]:
+             if user_db.credits > 0:
+                 logger.info(f"Sync detected expired plan. Zeroing {user_db.credits} credits.")
+                 user_db.credits = 0
+             
+             user_db.plan = "Free"
+             user_db.subscription_id = None
+             user_db.billing_cycle = None
+             final_status = "cancelled"
 
         if real_status == "active" and is_scheduled_cancel:
             next_date = getattr(dodo_sub, 'next_billing_date', None)

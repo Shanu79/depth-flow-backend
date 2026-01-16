@@ -60,7 +60,7 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
         
         # --- ENFORCE DEFAULTS ---
         plan="Free",              # Always start as Free
-        credits=20,               # Give starter credits (e.g. 5)
+        credits=0,               # Give starter credits (e.g. 5)
         billing_cycle="monthly",  # Default to monthly
         subscription_status="active" # Free plan is always active
     )

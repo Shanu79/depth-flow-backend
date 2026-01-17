@@ -151,7 +151,7 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
                 
                 # --- ENFORCE DEFAULTS ---
                 plan="Free",
-                credits=20,
+                credits=0,
                 subscription_status="active",
                 billing_cycle="monthly"
             )

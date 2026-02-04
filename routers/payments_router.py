@@ -41,7 +41,7 @@ PLAN_CONFIG = {
 }
 
 ONE_TIME_PLANS = {
-    "Trial": {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 150}
+    "Trial": {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 120}
 }
 
 class CheckoutRequest(BaseModel):

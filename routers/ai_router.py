@@ -257,11 +257,6 @@ async def generate_3d(
             output_path = f"static/{filename}"
             save_video_direct(immersity_video_url, output_path)
 
-        # 6. CLEANUP & RETURN
-        background_tasks.add_task(cleanup_old_files)
-        current_user.credits -= COST_PER_GENERATION
-        db.commit()
-
         base_url = os.getenv("BASE_URL", "http://localhost:8000")
         final_url = f"{base_url}/static/{filename}"
 

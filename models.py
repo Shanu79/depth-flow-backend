@@ -1,6 +1,7 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime # <--- 1. Import DateTime
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
+from sqlalchemy.orm import relationship
 from database import Base
-from datetime import datetime # <--- 2. Import datetime for default values if needed
+from datetime import datetime
 
 class User(Base):
     __tablename__ = "users"
@@ -25,3 +26,18 @@ class User(Base):
     credits = Column(Integer, default=0)
     last_login_ip = Column(String, nullable=True)
     is_admin = Column(Boolean, default=False)
+    
+class GenerationHistory(Base):
+    __tablename__ = "generation_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    video_url = Column(String, nullable=False)
+    # We calculate expiry based on created_at + 30 mins
+    created_at = Column(DateTime, default=datetime.utcnow) 
+    
+    # Relationship to user
+    owner = relationship("User", back_populates="generations")
+
+# Update User class to include the relationship
+User.generations = relationship("GenerationHistory", back_populates="owner")

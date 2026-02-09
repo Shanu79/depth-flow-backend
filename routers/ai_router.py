@@ -7,7 +7,8 @@ import imageio_ffmpeg
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User
+from models import User, GenerationHistory
+from datetime import datetime, timedelta
 from auth import get_current_user
 import shutil
 import gc
@@ -264,13 +265,61 @@ async def generate_3d(
         base_url = os.getenv("BASE_URL", "http://localhost:8000")
         final_url = f"{base_url}/static/{filename}"
 
+        # --- DB INSERTION START ---
+        new_history = GenerationHistory(
+            user_id=current_user.id,
+            video_url=final_url,
+            created_at=datetime.utcnow()
+        )
+        db.add(new_history)
+        # --- DB INSERTION END ---
+
+        # 6. CLEANUP & RETURN
+        background_tasks.add_task(cleanup_old_files)
+        current_user.credits -= COST_PER_GENERATION
+        db.commit() # This commits both the credit deduction AND the new history
+
         return {
             "status": "success", 
             "video_url": final_url,
             "plan": current_user.plan,
-            "remaining_credits": current_user.credits
+            "remaining_credits": current_user.credits,
+            # Return the ID so frontend can update immediately
+            "history_id": new_history.id 
         }
 
     except Exception as e:
         print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+# --- NEW ENDPOINT: GET HISTORY ---
+@router.get("/history")
+async def get_history(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Fetch last 20 items, newest first
+    history = db.query(GenerationHistory)\
+        .filter(GenerationHistory.user_id == current_user.id)\
+        .order_by(GenerationHistory.created_at.desc())\
+        .limit(20)\
+        .all()
+    
+    # Calculate expiry based on your 30 minute cleanup rule
+    results = []
+    for item in history:
+        # Calculate remaining seconds
+        expires_at = item.created_at + timedelta(minutes=30)
+        remaining = (expires_at - datetime.utcnow()).total_seconds()
+        
+        is_expired = remaining <= 0
+        
+        results.append({
+            "id": item.id,
+            "video_url": item.video_url,
+            "created_at": item.created_at.isoformat(),
+            "expires_in_seconds": max(0, int(remaining)),
+            "is_expired": is_expired
+        })
+        
+    return results

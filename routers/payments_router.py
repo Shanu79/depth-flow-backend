@@ -41,7 +41,8 @@ PLAN_CONFIG = {
 }
 
 ONE_TIME_PLANS = {
-    "Trial": {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 120}
+    "Trial": {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 120},
+    "Credits Pack": {"id": "pdt_0NYCtBgPqWWzyF6yKrE98", "credits": 750},
 }
 
 class CheckoutRequest(BaseModel):
@@ -81,6 +82,12 @@ async def create_checkout_session(
     credits_to_add = 0
     is_one_time = False
 
+    # Define active status helper early for reuse
+    current_status = current_user.subscription_status or ""
+    has_active_sub = current_user.subscription_id and (
+        current_status == "active" or "Scheduled for cancellation" in current_status
+    )
+
     # ---------------------------------------------------------
     # STEP 1: VALIDATE PLAN (One-Time vs Recurring)
     # ---------------------------------------------------------
@@ -93,23 +100,30 @@ async def create_checkout_session(
         
         target_product_id = plan_data["id"]
 
-        # --- HISTORY CHECK (Strict Mode) ---
+        # --- LOGIC A.1: HISTORY CHECK (Trial) ---
         if request.plan_name == "Trial":
-            # 1. Quick Local Check
             if current_user.plan == "Trial":
                 raise HTTPException(status_code=403, detail="You already have the Trial pack.")
             
-            # 2. Deep API Check
             already_bought = check_if_already_purchased(current_user.email, target_product_id)
             if already_bought:
                 raise HTTPException(status_code=403, detail="You have already used the Trial pack in the past.")
-        
+
+        # --- LOGIC A.2: SUBSCRIPTION CHECK (Credit Pack) ---
+        # User must have an active subscription to buy add-on credits
+        if request.plan_name == "Credits Pack":
+            if not has_active_sub:
+                raise HTTPException(
+                    status_code=403, 
+                    detail="You must have an active subscription (Basic or Pro) to purchase add-on credit packs."
+                )
+
         credits_to_add = plan_data["credits"]
         is_one_time = True
 
     # CASE B: RECURRING SUBSCRIPTION
     else:
-        cycle_data = PLAN_CONFIG.get(request.billing_cycle) # Make sure you renamed PLAN_CONFIG to SUBSCRIPTION_PLANS or use PLAN_CONFIG here
+        cycle_data = PLAN_CONFIG.get(request.billing_cycle)
         if not cycle_data:
             raise HTTPException(status_code=400, detail="Invalid billing cycle")
 
@@ -118,21 +132,16 @@ async def create_checkout_session(
             raise HTTPException(status_code=400, detail=f"Invalid plan: {request.plan_name}")
 
         target_product_id = plan_data["id"]
-        credits_to_add = plan_data["credits"] # Usually 0 for upgrades, but needed for new subs
+        credits_to_add = plan_data["credits"]
 
 
     # ---------------------------------------------------------
     # STEP 2: EXECUTE PAYMENT
     # ---------------------------------------------------------
     
-    current_status = current_user.subscription_status or ""
-    has_active_sub = current_user.subscription_id and (
-        current_status == "active" or "Scheduled for cancellation" in current_status
-    )
-
     try:
         # --- SCENARIO A: MODIFY EXISTING SUBSCRIPTION ---
-        # CRITICAL FIX: Only enter this block if it is NOT a one-time purchase
+        # Only if user has active sub AND this is NOT a one-time purchase
         if has_active_sub and not is_one_time:
             
             # 1. Reactivate if needed
@@ -192,8 +201,7 @@ async def create_checkout_session(
             }
 
             logger.info(f"🛒 GENERATING CHECKOUT FOR: {target_product_id}")
-            logger.info(f"📦 CART PAYLOAD: {[ {'product_id': target_product_id, 'quantity': request.quantity} ]}")
-
+            
             session = client.checkout_sessions.create(
                 product_cart=[{
                     "product_id": target_product_id, 

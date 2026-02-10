@@ -298,16 +298,25 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         if event_type == "payment.failed":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
-            product_id = data.get("product_id") or (data.get("product_cart", [{}])[0].get("product_id"))
             
-            # Try to find specific error messages in common locations
+            # --- SAFER PRODUCT ID EXTRACTION ---
+            product_id = data.get("product_id")
+            
+            # If not found at root, check product_cart safely
+            if not product_id:
+                cart = data.get("product_cart")
+                # Ensure cart is actually a list and not None before accessing index [0]
+                if cart and isinstance(cart, list) and len(cart) > 0:
+                    product_id = cart[0].get("product_id")
+            
+            # Try to find specific error messages
             error_reason = data.get("error") or data.get("failure_message") or data.get("message")
             
             logger.error("❌ --- PAYMENT FAILED DIAGNOSTIC ---")
             logger.error(f"User ID: {user_id}")
             logger.error(f"Target Product: {product_id}")
             logger.error(f"Error Message: {error_reason}")
-            logger.error(f"Full Data Payload: {data}") # Prints everything so you don't miss hidden fields
+            logger.error(f"Full Data Payload: {data}") 
             logger.error("-------------------------------------")
 
         # --- HANDLER: PAYMENT SUCCEEDED ---

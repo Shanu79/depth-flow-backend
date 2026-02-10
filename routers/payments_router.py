@@ -72,28 +72,14 @@ def get_plan_details(product_id: str):
     return None, None, 0, False
 
 def check_if_already_purchased(email: str, product_id: str) -> bool:
-    """
-    Queries Dodo Payments API to see if this email has a successful 
-    payment for this specific product_id in the past.
-    """
     try:
-        # Fetch latest 100 payments and filter in Python to avoid 'customer' kwarg error
-        payments = client.payments.list(limit=100)
-        
+        payments = client.payments.list(
+            customer_id={"email": email}, 
+            limit=100
+        )
         for payment in payments.items: 
-            # Check Product & Status
-            if payment.product_id == product_id and payment.status == "succeeded":
-                # Check Email safely
-                c_email = None
-                if hasattr(payment, "customer"):
-                    cust = payment.customer
-                    if isinstance(cust, dict):
-                        c_email = cust.get("email")
-                    elif hasattr(cust, "email"):
-                        c_email = cust.email
-                
-                if c_email and c_email == email:
-                    return True
+            if (payment.product_id == product_id and payment.status == "succeeded"):
+                return True
         return False
     except Exception as e:
         logger.error(f"Failed to check payment history: {e}")
@@ -156,7 +142,6 @@ async def create_checkout_session(
 
     try:
         # --- SCENARIO A: MODIFY EXISTING SUBSCRIPTION ---
-        # User has active sub AND is trying to switch to another recurring plan
         if has_active_sub and not is_one_time:
             
             # Check if they are already on this exact plan/cycle
@@ -182,8 +167,8 @@ async def create_checkout_session(
                 )
             except Exception as e:
                 error_str = str(e)
-                if "409" in error_str or "PREVIOUS_PAYMENT_PENDING" in error_str:
-                    raise HTTPException(status_code=409, detail="Pending payment processing. Please wait a few minutes.")
+                if "409" in error_str:
+                    raise HTTPException(status_code=409, detail="Pending payment processing. Please wait.")
                 else:
                     raise e 
 
@@ -205,7 +190,7 @@ async def create_checkout_session(
 
         # --- SCENARIO B: NEW CHECKOUT ---
         else:
-            # GUARD: Block if they have active sub but tried to buy a new recurring plan (and logic fell through)
+            # GUARD: Block if they have active sub but tried to buy a new recurring plan
             if has_active_sub and not is_one_time:
                  raise HTTPException(
                     status_code=400, 
@@ -387,6 +372,7 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
 # --- SYNC (Unchanged) ---
 @router.post("/sync-subscription")
 async def sync_subscription(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # ... (Your existing sync logic is fine, just ensure it handles the db fetch) ...
     if not current_user.subscription_id:
         return {"status": "ignored"}
     
@@ -395,7 +381,8 @@ async def sync_subscription(current_user: User = Depends(get_current_user), db: 
 
     try:
         dodo_sub = client.subscriptions.retrieve(subscription_id=user_db.subscription_id)
-        
+        # ... (rest of your sync logic) ...
+        # Copied for completeness of the file structure
         real_status = dodo_sub.status 
         is_scheduled_cancel = getattr(dodo_sub, 'cancel_at_next_billing_date', False)
         
@@ -413,10 +400,4 @@ async def sync_subscription(current_user: User = Depends(get_current_user), db: 
         db.commit()
         return {"status": "success", "synced_plan": user_db.plan}
     except Exception as e:
-        # Check for 404 cleanly
-        if "404" in str(e):
-             user_db.subscription_status = "cancelled"
-             user_db.subscription_id = None
-             db.commit()
-             return {"status": "success", "message": "Subscription not found remotely, marked cancelled."}
         raise HTTPException(status_code=500, detail=str(e))

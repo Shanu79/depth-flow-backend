@@ -48,6 +48,22 @@ class CheckoutRequest(BaseModel):
     plan_name: str
     billing_cycle: str
     quantity: int = 1
+    
+def get_dodo_customer_id(email: str) -> Optional[str]:
+    """
+    Finds the Dodo Customer ID (e.g., 'cus_123') for a given email.
+    Returns None if not found.
+    """
+    try:
+        # Most SDKs support filtering customers by email directly
+        customers = client.customers.list(email=email, limit=1)
+        
+        if customers.items:
+            return customers.items[0].customer_id
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching customer by email: {e}")
+        return None
 
 # --- HELPER: GET PLAN DETAILS FROM PRODUCT ID ---
 def get_plan_details(product_id: str):
@@ -73,14 +89,25 @@ def get_plan_details(product_id: str):
 
 def check_if_already_purchased(email: str, product_id: str) -> bool:
     try:
+        # STEP 1: Get the real Customer ID first
+        customer_id = get_dodo_customer_id(email)
+        
+        # If customer doesn't exist in Dodo yet, they haven't bought anything.
+        if not customer_id:
+            return False
+
+        # STEP 2: List payments using the valid string ID
         payments = client.payments.list(
-            customer_id={"email": email}, 
+            customer_id=customer_id, 
             limit=100
         )
+        
+        # STEP 3: Check for success
         for payment in payments.items: 
             if (payment.product_id == product_id and payment.status == "succeeded"):
                 return True
         return False
+        
     except Exception as e:
         logger.error(f"Failed to check payment history: {e}")
         return False
@@ -247,7 +274,7 @@ async def cancel_subscription(
         raise HTTPException(status_code=500, detail=f"Failed to cancel: {str(e)}")
 
 
-# --- 3. WEBHOOK (Robust) ---
+# --- 3. WEBHOOK (With Debug Logging) ---
 @router.post("/webhook")
 async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
     try:
@@ -267,7 +294,24 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         
         logger.info(f"Webhook Event: {event_type}")
 
-        if event_type == "payment.succeeded":
+        # --- HANDLER: PAYMENT FAILED ---
+        if event_type == "payment.failed":
+            metadata = data.get("metadata", {})
+            user_id = metadata.get("user_id")
+            product_id = data.get("product_id") or (data.get("product_cart", [{}])[0].get("product_id"))
+            
+            # Try to find specific error messages in common locations
+            error_reason = data.get("error") or data.get("failure_message") or data.get("message")
+            
+            logger.error("❌ --- PAYMENT FAILED DIAGNOSTIC ---")
+            logger.error(f"User ID: {user_id}")
+            logger.error(f"Target Product: {product_id}")
+            logger.error(f"Error Message: {error_reason}")
+            logger.error(f"Full Data Payload: {data}") # Prints everything so you don't miss hidden fields
+            logger.error("-------------------------------------")
+
+        # --- HANDLER: PAYMENT SUCCEEDED ---
+        elif event_type == "payment.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
             
@@ -284,7 +328,6 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                 is_one_time = metadata.get("is_one_time") == "true"
                 
                 # --- ROBUST PRODUCT ID EXTRACTION ---
-                # Checks 3 different locations for the Product ID to be safe
                 purchased_product_id = None
                 
                 # 1. Try Product Cart
@@ -337,7 +380,6 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
 
         # --- OTHER EVENTS (Updates, Cancellations) ---
         elif event_type == "subscription.updated":
-            # ... (Same as your code) ...
             sub_id = data.get("subscription_id")
             product_id = data.get("product_id")
             status = data.get("status")

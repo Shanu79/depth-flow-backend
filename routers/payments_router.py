@@ -48,68 +48,26 @@ class CheckoutRequest(BaseModel):
     plan_name: str
     billing_cycle: str
     quantity: int = 1
-    
-def get_dodo_customer_id(email: str) -> Optional[str]:
-    """
-    Finds the Dodo Customer ID (e.g., 'cus_123') for a given email.
-    Returns None if not found.
-    """
-    try:
-        # Most SDKs support filtering customers by email directly
-        customers = client.customers.list(email=email, limit=1)
-        
-        if customers.items:
-            return customers.items[0].customer_id
-        return None
-    except Exception as e:
-        logger.error(f"Error fetching customer by email: {e}")
-        return None
 
-# --- HELPER: GET PLAN DETAILS FROM PRODUCT ID ---
-def get_plan_details(product_id: str):
-    """
-    Reverse lookup: Finds the Plan Name and Cycle based on the Dodo Product ID.
-    Returns: (plan_name, billing_cycle, credits, is_found)
-    """
-    if not product_id:
-        return None, None, 0, False
-
-    # Check Recurring Plans
-    for cycle, plans in PLAN_CONFIG.items():
-        for p_name, p_data in plans.items():
-            if p_data["id"] == product_id:
-                return p_name, cycle, p_data["credits"], True
-    
-    # Check One-Time Plans
-    for p_name, p_data in ONE_TIME_PLANS.items():
-        if p_data["id"] == product_id:
-            return p_name, "one_time", p_data["credits"], True
-            
-    return None, None, 0, False
-
+# Safer version if the dictionary approach fails
 def check_if_already_purchased(email: str, product_id: str) -> bool:
     try:
-        # STEP 1: Get the real Customer ID first
-        customer_id = get_dodo_customer_id(email)
+        # 1. Get Customer ID first
+        customers = client.customers.list(email=email, limit=1)
+        if not customers.items:
+            return False # Customer doesn't exist, so they haven't bought anything
         
-        # If customer doesn't exist in Dodo yet, they haven't bought anything.
-        if not customer_id:
-            return False
+        customer_id = customers.items[0].customer_id
 
-        # STEP 2: List payments using the valid string ID
-        payments = client.payments.list(
-            customer_id=customer_id, 
-            limit=100
-        )
-        
-        # STEP 3: Check for success
+        # 2. List payments using the ID string
+        payments = client.payments.list(customer_id=customer_id, limit=100)
+
         for payment in payments.items: 
-            if (payment.product_id == product_id and payment.status == "succeeded"):
+            if payment.product_id == product_id and payment.status == "succeeded":
                 return True
         return False
-        
     except Exception as e:
-        logger.error(f"Failed to check payment history: {e}")
+        logger.error(f"History check failed: {e}")
         return False
 
 # --- 1. UNIFIED CHECKOUT & UPGRADE/DOWNGRADE ---
@@ -134,19 +92,24 @@ async def create_checkout_session(
             raise HTTPException(status_code=400, detail="Invalid one-time plan")
         
         target_product_id = plan_data["id"]
-        is_one_time = True
-        credits_to_add = plan_data["credits"]
 
-        # --- HISTORY CHECK ---
+        # --- HISTORY CHECK (Strict Mode) ---
         if request.plan_name == "Trial":
+            # 1. Quick Local Check
             if current_user.plan == "Trial":
                 raise HTTPException(status_code=403, detail="You already have the Trial pack.")
-            if check_if_already_purchased(current_user.email, target_product_id):
-                raise HTTPException(status_code=403, detail="You have already used the Trial pack.")
+            
+            # 2. Deep API Check
+            already_bought = check_if_already_purchased(current_user.email, target_product_id)
+            if already_bought:
+                raise HTTPException(status_code=403, detail="You have already used the Trial pack in the past.")
         
+        credits_to_add = plan_data["credits"]
+        is_one_time = True
+
     # CASE B: RECURRING SUBSCRIPTION
     else:
-        cycle_data = PLAN_CONFIG.get(request.billing_cycle)
+        cycle_data = PLAN_CONFIG.get(request.billing_cycle) # Make sure you renamed PLAN_CONFIG to SUBSCRIPTION_PLANS or use PLAN_CONFIG here
         if not cycle_data:
             raise HTTPException(status_code=400, detail="Invalid billing cycle")
 
@@ -155,26 +118,23 @@ async def create_checkout_session(
             raise HTTPException(status_code=400, detail=f"Invalid plan: {request.plan_name}")
 
         target_product_id = plan_data["id"]
-        credits_to_add = plan_data["credits"]
+        credits_to_add = plan_data["credits"] # Usually 0 for upgrades, but needed for new subs
+
 
     # ---------------------------------------------------------
     # STEP 2: EXECUTE PAYMENT
     # ---------------------------------------------------------
-    current_status = current_user.subscription_status or ""
     
-    # Robust check for active subscription
+    current_status = current_user.subscription_status or ""
     has_active_sub = current_user.subscription_id and (
-        current_status == "active" or "Scheduled" in current_status
+        current_status == "active" or "Scheduled for cancellation" in current_status
     )
 
     try:
         # --- SCENARIO A: MODIFY EXISTING SUBSCRIPTION ---
+        # CRITICAL FIX: Only enter this block if it is NOT a one-time purchase
         if has_active_sub and not is_one_time:
             
-            # Check if they are already on this exact plan/cycle
-            if current_user.plan == request.plan_name and current_user.billing_cycle == request.billing_cycle:
-                 raise HTTPException(status_code=400, detail="You are already on this plan.")
-
             # 1. Reactivate if needed
             if "Scheduled for cancellation" in current_status:
                 try:
@@ -182,7 +142,8 @@ async def create_checkout_session(
                         subscription_id=current_user.subscription_id,
                         cancel_at_next_billing_date=False 
                     )
-                except Exception: pass 
+                except Exception:
+                    pass 
 
             # 2. Change Plan
             try:
@@ -194,12 +155,16 @@ async def create_checkout_session(
                 )
             except Exception as e:
                 error_str = str(e)
-                if "409" in error_str:
-                    raise HTTPException(status_code=409, detail="Pending payment processing. Please wait.")
+                if "PREVIOUS_PAYMENT_PENDING" in error_str or "409" in error_str:
+                    logger.warning(f"409 Error for user {current_user.id}: Pending Payment")
+                    raise HTTPException(
+                        status_code=409, 
+                        detail="A previous payment is currently processing. Please wait a few minutes for it to settle before changing plans."
+                    )
                 else:
                     raise e 
 
-            # 3. DB UPDATE
+            # 3. IMMEDIATE DB UPDATE
             current_user.plan = request.plan_name
             current_user.billing_cycle = request.billing_cycle
             current_user.subscription_status = "active"
@@ -211,19 +176,13 @@ async def create_checkout_session(
             
             return {
                 "action": "updated",
-                "message": f"Plan upgraded to {request.plan_name}. Active now.",
+                "message": f"Plan upgraded to {request.plan_name}. Active now. Next billing: {formatted_date}",
                 "checkout_url": None
             }
 
-        # --- SCENARIO B: NEW CHECKOUT ---
+        # --- SCENARIO B: NEW CHECKOUT (New Sub OR One-Time) ---
         else:
-            # GUARD: Block if they have active sub but tried to buy a new recurring plan
-            if has_active_sub and not is_one_time:
-                 raise HTTPException(
-                    status_code=400, 
-                    detail="You already have an active subscription. Please manage it from your settings."
-                )
-            
+            # We construct metadata to handle both cases
             metadata = {
                 "user_id": str(current_user.id),
                 "credits_to_add": str(credits_to_add),
@@ -232,9 +191,18 @@ async def create_checkout_session(
                 "is_one_time": "true" if is_one_time else "false"
             }
 
+            logger.info(f"🛒 GENERATING CHECKOUT FOR: {target_product_id}")
+            logger.info(f"📦 CART PAYLOAD: {[ {'product_id': target_product_id, 'quantity': request.quantity} ]}")
+
             session = client.checkout_sessions.create(
-                product_cart=[{"product_id": target_product_id, "quantity": request.quantity}],
-                customer={"email": current_user.email, "name": current_user.full_name or "User"},
+                product_cart=[{
+                    "product_id": target_product_id, 
+                    "quantity": request.quantity
+                }],
+                customer={
+                    "email": current_user.email,
+                    "name": current_user.full_name or "User"
+                },
                 metadata=metadata,
                 return_url=f"{FRONTEND_URL}/workspace", 
             )
@@ -243,10 +211,10 @@ async def create_checkout_session(
     except HTTPException as he:
         raise he 
     except Exception as e:
-        logger.error(f"Payment Error: {e}")
+        logger.error(f"Payment/Change Error: {e}")
         raise HTTPException(status_code=400, detail=f"Payment Error: {str(e)}")
 
-# --- 2. CANCEL SUBSCRIPTION (Unchanged) ---
+# --- 2. CANCEL SUBSCRIPTION ---
 @router.post("/cancel-subscription")
 async def cancel_subscription(
     current_user: User = Depends(get_current_user),
@@ -268,13 +236,18 @@ async def cancel_subscription(
         current_user.subscription_status = new_status
         db.commit()
 
-        return {"status": "success", "message": f"Subscription cancelled. Ends {formatted_date}.", "new_status": new_status}
+        return {
+            "status": "success", 
+            "message": f"Subscription cancelled. Access remains until {formatted_date}.",
+            "new_status": new_status
+        }
 
     except Exception as e:
+        logger.error(f"Cancellation API Failed: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to cancel: {str(e)}")
 
 
-# --- 3. WEBHOOK (With Debug Logging) ---
+# --- 3. WEBHOOK (Handles Credits for ALL Payments) ---
 @router.post("/webhook")
 async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
     try:
@@ -294,37 +267,12 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         
         logger.info(f"Webhook Event: {event_type}")
 
-        # --- HANDLER: PAYMENT FAILED ---
-        if event_type == "payment.failed":
+        # --- EVENT: PAYMENT SUCCEEDED ---
+        if event_type == "payment.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
             
-            # --- SAFER PRODUCT ID EXTRACTION ---
-            product_id = data.get("product_id")
-            
-            # If not found at root, check product_cart safely
-            if not product_id:
-                cart = data.get("product_cart")
-                # Ensure cart is actually a list and not None before accessing index [0]
-                if cart and isinstance(cart, list) and len(cart) > 0:
-                    product_id = cart[0].get("product_id")
-            
-            # Try to find specific error messages
-            error_reason = data.get("error") or data.get("failure_message") or data.get("message")
-            
-            logger.error("❌ --- PAYMENT FAILED DIAGNOSTIC ---")
-            logger.error(f"User ID: {user_id}")
-            logger.error(f"Target Product: {product_id}")
-            logger.error(f"Error Message: {error_reason}")
-            logger.error(f"Full Data Payload: {data}") 
-            logger.error("-------------------------------------")
-
-        # --- HANDLER: PAYMENT SUCCEEDED ---
-        elif event_type == "payment.succeeded":
-            metadata = data.get("metadata", {})
-            user_id = metadata.get("user_id")
-            
-            # Identify User
+            # 1. Identify User
             user = None
             if user_id:
                 user = db.query(User).filter(User.id == int(user_id)).first()
@@ -334,84 +282,95 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
 
             if user:
                 new_sub_id = data.get("subscription_id")
+                is_renewal = user.subscription_id == new_sub_id
+                
+                # --- 1. CHECK ONE-TIME FLAG ---
+                # We interpret the string "true" from metadata
                 is_one_time = metadata.get("is_one_time") == "true"
-                
-                # --- ROBUST PRODUCT ID EXTRACTION ---
-                purchased_product_id = None
-                
-                # 1. Try Product Cart
-                if "product_cart" in data and isinstance(data["product_cart"], list) and len(data["product_cart"]) > 0:
-                    purchased_product_id = data["product_cart"][0].get("product_id")
-                
-                # 2. Try Root Level
-                if not purchased_product_id:
-                    purchased_product_id = data.get("product_id")
 
-                # 3. Try Lines (Stripe style)
-                if not purchased_product_id and "lines" in data:
-                     lines = data.get("lines", {}).get("data", [])
-                     if lines: purchased_product_id = lines[0].get("price", {}).get("product")
-
-                logger.info(f"Extracted Product ID: {purchased_product_id}")
-
-                # --- VERIFY PLAN ---
-                real_plan_name, real_cycle, real_credits, found_plan = get_plan_details(purchased_product_id)
-
-                # --- DETERMINE CREDITS ---
+                # --- 2. DETERMINE CREDITS ---
                 credits_to_add = 0
-                
-                if found_plan:
-                    credits_to_add = real_credits
-                    logger.info(f"Verified Plan via Config: {real_plan_name}")
-                else:
-                    # FALLBACK to Metadata
-                    logger.warning(f"Product ID {purchased_product_id} not in config. Using metadata fallback.")
-                    credits_to_add = int(metadata.get("credits_to_add", 0))
-                    real_plan_name = metadata.get("plan_name", user.plan)
-                    real_cycle = metadata.get("billing_cycle", user.billing_cycle)
+                source = "Unknown"
 
-                # --- UPDATE DB ---
+                if "credits_to_add" in metadata:
+                    # Case A: New Subscription OR One-Time Pack
+                    credits_to_add = int(metadata.get("credits_to_add"))
+                    source = "Metadata (New/One-Time)"
+                elif is_renewal:
+                    # Case B: Auto-Renewal (Recurring)
+                    current_cycle = PLAN_CONFIG.get(user.billing_cycle, {})
+                    current_plan = current_cycle.get(user.plan, {})
+                    credits_to_add = current_plan.get("credits", 0)
+                    source = f"Auto-Renewal ({user.plan})"
+
+                # --- 3. ADD CREDITS ---
                 if credits_to_add > 0:
-                    user.credits += credits_to_add
-                    logger.info(f"Added {credits_to_add} credits to User {user.id}")
+                    user.credits += credits_to_add # Use += so we don't reset existing credits
+                    logger.info(f"ADDED {credits_to_add} CREDITS to User {user.email}. Source: {source}")
 
+                # --- 4. SYNC STATE (PROTECTED) ---
                 if is_one_time:
+                    # FOR ONE-TIME PAYMENTS:
+                    # We ONLY update the plan name if the user has NO active subscription.
+                    # This records that they bought the Trial, but protects "Pro" users from being overwritten.
                     if not user.subscription_id or user.subscription_status != "active":
-                         user.plan = real_plan_name
+                         user.plan = metadata.get("plan_name", user.plan)
+                    
+                    # We DO NOT update subscription_id or billing_cycle for one-time payments.
                 else:
+                    # FOR SUBSCRIPTIONS:
                     if new_sub_id:
                         user.subscription_id = new_sub_id
                         user.subscription_status = "active"
-                    if real_plan_name: user.plan = real_plan_name
-                    if real_cycle: user.billing_cycle = real_cycle
                     
+                    if metadata.get("plan_name"): user.plan = metadata["plan_name"]
+                    if metadata.get("billing_cycle"): user.billing_cycle = metadata["billing_cycle"]
+
                 db.commit()
 
-        # --- OTHER EVENTS (Updates, Cancellations) ---
+        # --- EVENT: SUBSCRIPTION UPDATED ---
         elif event_type == "subscription.updated":
             sub_id = data.get("subscription_id")
             product_id = data.get("product_id")
             status = data.get("status")
+
             user = db.query(User).filter(User.subscription_id == sub_id).first()
+            
             if user:
                 user.subscription_status = status
-                _, _, _, found = get_plan_details(product_id)
-                # Only update plan info if we found the product ID in our config
-                if found:
-                    p_name, cycle, _, _ = get_plan_details(product_id)
-                    user.plan = p_name
-                    user.billing_cycle = cycle
+                
+                # Keep Plan in Sync
+                found_plan = False
+                for cycle, plans in PLAN_CONFIG.items():
+                    for p_name, p_data in plans.items():
+                        if p_data["id"] == product_id:
+                            user.plan = p_name
+                            user.billing_cycle = cycle
+                            found_plan = True
+                            break
+                    if found_plan: break
+                
                 db.commit()
 
+        # --- EVENT: SUBSCRIPTION CANCELLED ---
         elif event_type == "subscription.cancelled":
             sub_id = data.get("subscription_id")
             user = db.query(User).filter(User.subscription_id == sub_id).first()
-            if user:
+            
+            if user and user.subscription_id == sub_id:
+                logger.info(f"Subscription expired for User {user.email}. Zeroing credits.")
+                
+                # 1. Update Status
                 user.subscription_status = "cancelled"
                 user.plan = "Free"
+                
+                # 2. ZERO OUT CREDITS (The Requirement)
                 user.credits = 0 
+                
+                # 3. Cleanup IDs
                 user.subscription_id = None
                 user.billing_cycle = None
+                
                 db.commit()
 
         return {"status": "received"}
@@ -420,35 +379,100 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         logger.error(f"Webhook Error: {e}")
         return {"status": "error", "detail": str(e)}
     
-# --- SYNC (Unchanged) ---
+
 @router.post("/sync-subscription")
-async def sync_subscription(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # ... (Your existing sync logic is fine, just ensure it handles the db fetch) ...
+async def sync_subscription(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Force-syncs local DB with Dodo.
+    Uses explicit DB re-fetching to ensure updates persist.
+    """
     if not current_user.subscription_id:
-        return {"status": "ignored"}
-    
+        return {"status": "ignored", "message": "No active subscription to sync."}
+
+    # 1. CRITICAL FIX: Re-fetch user from the current DB session
+    # This ensures we are modifying the actual DB row, not a copy.
     user_db = db.query(User).filter(User.id == current_user.id).first()
-    if not user_db: raise HTTPException(status_code=404)
+    
+    if not user_db:
+        raise HTTPException(status_code=404, detail="User not found in DB")
 
     try:
-        dodo_sub = client.subscriptions.retrieve(subscription_id=user_db.subscription_id)
-        # ... (rest of your sync logic) ...
-        # Copied for completeness of the file structure
+        # 2. Fetch REAL status from Dodo
+        dodo_sub = client.subscriptions.retrieve(
+            subscription_id=user_db.subscription_id
+        )
+
+        # 3. Determine Status
         real_status = dodo_sub.status 
-        is_scheduled_cancel = getattr(dodo_sub, 'cancel_at_next_billing_date', False)
+        real_product_id = dodo_sub.product_id
         
+        # Check for scheduled cancellation
+        is_scheduled_cancel = getattr(dodo_sub, 'cancel_at_next_billing_date', False) or \
+                              getattr(dodo_sub, 'cancel_at_period_end', False)
+                              
         if real_status in ["cancelled", "expired", "past_due"]:
-             if user_db.credits > 0: user_db.credits = 0
+             if user_db.credits > 0:
+                 logger.info(f"Sync detected expired plan. Zeroing {user_db.credits} credits.")
+                 user_db.credits = 0
+             
              user_db.plan = "Free"
              user_db.subscription_id = None
+             user_db.billing_cycle = None
              final_status = "cancelled"
-        elif real_status == "active" and is_scheduled_cancel:
-            final_status = "Scheduled for cancellation"
+
+        if real_status == "active" and is_scheduled_cancel:
+            next_date = getattr(dodo_sub, 'next_billing_date', None)
+            fmt_date = str(next_date)[:10] if next_date else "soon"
+            final_status = f"Scheduled for cancellation on {fmt_date}"
         else:
             final_status = real_status
 
-        user_db.subscription_status = final_status
+        # 4. Apply Status Update
+        if user_db.subscription_status != final_status:
+             user_db.subscription_status = final_status
+
+        # 5. Apply Plan Update (Reverse Lookup)
+        found_plan = False
+        for cycle, plans in PLAN_CONFIG.items():
+            for p_name, p_data in plans.items():
+                # Compare IDs safely (strip whitespace just in case)
+                config_id = str(p_data["id"]).strip()
+                remote_id = str(real_product_id).strip()
+                
+                if config_id == remote_id:
+                    if user_db.plan != p_name:
+                        print(f"UPDATING PLAN: {user_db.plan} -> {p_name}")
+                        user_db.plan = p_name
+                        user_db.billing_cycle = cycle
+                    found_plan = True
+                    break
+            if found_plan: break
+        
+        if not found_plan:
+            print(f"WARNING: Product ID {real_product_id} not found in PLAN_CONFIG.")
+
+        # 6. Force Save
+        db.add(user_db)
         db.commit()
-        return {"status": "success", "synced_plan": user_db.plan}
+        db.refresh(user_db) # Reload to confirm
+
+        return {
+            "status": "success", 
+            "message": "Subscription synced successfully.",
+            "synced_status": user_db.subscription_status,
+            "synced_plan": user_db.plan
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"SYNC ERROR: {e}")
+        logger.error(f"Sync Failed: {e}")
+        # Handle remote deletion
+        if "404" in str(e):
+             user_db.subscription_status = "canceled"
+             user_db.subscription_id = None
+             db.commit()
+             return {"status": "success", "message": "Subscription was deleted remotely."}
+        raise HTTPException(status_code=500, detail="Failed to sync subscription.")

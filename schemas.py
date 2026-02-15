@@ -12,23 +12,25 @@ class UserCreate(BaseModel):
     full_name: str
     plan: str = "free"
 
+# --- NEW: Schema for Admin Updates ---
+class UserUpdate(BaseModel):
+    credits: int
+    plan: str
+
 class Token(BaseModel):
     access_token: str
     token_type: str
 
 class UserResponse(BaseModel):
-    id: int               # Critical for React keys
-    email: EmailStr       # Good practice to use EmailStr here too
+    id: int               
+    email: EmailStr       
     full_name: Optional[str] = None
     credits: int
     plan: str
     profile_pic: Optional[str] = None
     
-    # Critical for Admin Panel
     is_admin: bool = False 
     subscription_status: Optional[str] = "inactive"
-    
     subscription_id: Optional[str] = None
 
-    # Pydantic V2 Configuration
     model_config = ConfigDict(from_attributes=True)

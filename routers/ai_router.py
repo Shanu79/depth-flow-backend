@@ -4,8 +4,8 @@ import time
 import httpx
 import subprocess
 import imageio_ffmpeg
-import shutil
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks, Request
+import asyncio
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
 from database import get_db, SessionLocal
 from models import User, GenerationHistory
@@ -18,10 +18,9 @@ router = APIRouter(prefix="/ai", tags=["AI Generation"])
 MEDIA_CLOUD_REST_API_BASE_URL = 'https://api.immersity.ai'
 IMMERSITY_CLIENT_ID = os.getenv("IMMERSITY_CLIENT_ID")
 IMMERSITY_CLIENT_SECRET = os.getenv("IMMERSITY_CLIENT_SECRET")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change_this_to_a_r@ndom_string")
 COST_PER_GENERATION = 20
 
-# --- ASYNC HELPER FUNCTIONS ---
+# --- 1. ASYNC HELPER FUNCTIONS ---
 async def get_immersity_token(client: httpx.AsyncClient):
     url = "https://auth.immersity.ai/auth/realms/immersity/protocol/openid-connect/token"
     payload = {
@@ -41,9 +40,23 @@ async def get_upload_url(client: httpx.AsyncClient, token: str, filename: str, c
     response.raise_for_status()
     return response.json()
 
-# --- SYNC HELPER FUNCTIONS (For Background Tasks) ---
+async def poll_presigned_url(client: httpx.AsyncClient, url: str, max_retries=60, sleep_time=2.0):
+    """
+    Checks if Immersity has finished writing the file to the S3 bucket.
+    Uses stream to check status without downloading the heavy video body.
+    """
+    for _ in range(max_retries):
+        try:
+            async with client.stream("GET", url) as response:
+                if response.status_code == 200:
+                    return True
+        except Exception:
+            pass
+        await asyncio.sleep(sleep_time)
+    return False
+
+# --- 2. SYNC VIDEO PROCESSING FUNCTIONS ---
 def save_video_direct(input_url, output_path):
-    """Downloads the video directly using httpx.stream for memory safety."""
     try:
         with httpx.Client() as client:
             with client.stream("GET", input_url) as r:
@@ -57,7 +70,6 @@ def save_video_direct(input_url, output_path):
 def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png"):
     temp_input = f"temp_{uuid.uuid4()}.mp4"
     try:
-        # 1. STREAM DOWNLOAD TO DISK
         with httpx.Client() as client:
             with client.stream("GET", input_url) as r:
                 r.raise_for_status()
@@ -65,20 +77,16 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
                     for chunk in r.iter_bytes(chunk_size=8192):
                         f.write(chunk)
 
-        # 2. GET FFMPEG PATH
         try:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        except:
-            print("⚠️ FFmpeg binary not found. Saving original.")
+        except Exception:
             os.rename(temp_input, output_path)
             return
 
         if not os.path.exists(watermark_path):
-            print(f"⚠️ Watermark missing at {watermark_path}. Saving original.")
             os.rename(temp_input, output_path)
             return
 
-        # 3. RUN FFMPEG
         command = [
             ffmpeg_exe, '-y',
             '-i', temp_input, 
@@ -92,42 +100,16 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
             output_path
         ]
         subprocess.run(command, check=True, capture_output=True)
-
         if os.path.exists(temp_input):
             os.remove(temp_input)
 
     except Exception as e:
         print(f"⚠️ Video Processing Failed: {str(e)}")
-        # Fallback logic
         if os.path.exists(temp_input):
-            if os.path.exists(output_path):
-                os.remove(output_path)
             os.rename(temp_input, output_path)
-        else:
-            try:
-                with httpx.Client() as client:
-                    with client.stream("GET", input_url) as r:
-                        with open(output_path, 'wb') as f:
-                            for chunk in r.iter_bytes(chunk_size=8192):
-                                f.write(chunk)
-            except:
-                pass
 
-def cleanup_old_files(folder="static", age_limit=1800): 
-    """Deletes files older than 30 mins."""
-    now = time.time()
-    if not os.path.exists(folder):
-        return
-    for filename in os.listdir(folder):
-        file_path = os.path.join(folder, filename)
-        if os.path.isfile(file_path):
-            if os.stat(file_path).st_mtime < (now - age_limit):
-                try: os.remove(file_path)
-                except: pass
-
-# --- BACKGROUND WEBHOOK PROCESSOR ---
-def process_finished_video_no_db_state(user_id: int, should_watermark: bool, immersity_video_url: str):
-    """Processes the video in the background and saves it to the DB upon completion."""
+def process_and_save_video(user_id: int, immersity_video_url: str, should_watermark: bool):
+    """Handles FFMPEG processing and DB saving in a separate thread."""
     db = SessionLocal() 
     try:
         correlation_id = str(uuid.uuid4())
@@ -142,7 +124,6 @@ def process_finished_video_no_db_state(user_id: int, should_watermark: bool, imm
         base_url = os.getenv("BASE_URL", "http://localhost:8000")
         final_url = f"{base_url}/static/{filename}"
 
-        # Create DB record ONLY when finished
         new_history = GenerationHistory(
             user_id=user_id,
             video_url=final_url,
@@ -152,8 +133,7 @@ def process_finished_video_no_db_state(user_id: int, should_watermark: bool, imm
         db.commit()
 
     except Exception as e:
-        print(f"❌ Webhook Processing Failed: {e}")
-        # Refund credits if processing fails
+        print(f"❌ Processing Thread Failed: {e}")
         user = db.query(User).filter(User.id == user_id).first()
         if user:
             user.credits += COST_PER_GENERATION
@@ -161,8 +141,90 @@ def process_finished_video_no_db_state(user_id: int, should_watermark: bool, imm
     finally:
         db.close()
 
+def cleanup_old_files(folder="static", age_limit=1800): 
+    now = time.time()
+    if not os.path.exists(folder): return
+    for filename in os.listdir(folder):
+        file_path = os.path.join(folder, filename)
+        if os.path.isfile(file_path) and os.stat(file_path).st_mtime < (now - age_limit):
+            try: os.remove(file_path)
+            except: pass
 
-# --- 1. INITIATOR ENDPOINT ---
+# --- 3. THE CORE BACKGROUND ORCHESTRATOR ---
+async def background_generation_task(
+    user_id: int, token: str, input_image_url: str, 
+    depth: int, speed: int, duration: int, style: str, should_watermark: bool
+):
+    """
+    Runs fully in the background. Handles waiting for Immersity without blocking users.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            # 1. Start Disparity
+            disp_response = await client.post(
+                f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/disparity',
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"correlationId": str(uuid.uuid4()), "inputImageUrl": input_image_url},
+                timeout=30.0
+            )
+            disp_response.raise_for_status()
+            input_disparity_url = disp_response.json().get('resultPresignedUrl')
+
+            # 2. POLL Disparity: Wait until file actually exists
+            is_disparity_ready = await poll_presigned_url(client, input_disparity_url)
+            if not is_disparity_ready:
+                raise Exception("Disparity generation timed out.")
+
+            # 3. Configure Physics
+            intensity = max(min((float(depth) * (float(speed) / 5.0) * (float(duration) / 5.0)), 10.0), 0.5)
+            params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
+
+            if style == "Orbit":
+                params.update({"amplitudeX": intensity * 1.0, "amplitudeY": intensity * 0.5, "phaseY": 0.25})
+            elif style == "Dolly":
+                params.update({"amplitudeX": intensity * 0.8, "amplitudeZ": intensity * 0.3, "phaseX": 0.0})
+            elif style == "Zoom":
+                params.update({"amplitudeZ": intensity * 1.0, "amplitudeX": 0.0})
+
+            # 4. Start Animation (Removed webhookUrl)
+            anim_payload = {
+                "correlationId": str(uuid.uuid4()),
+                "inputImageUrl": input_image_url,
+                "inputDisparityUrl": input_disparity_url,
+                "animationLength": float(duration), 
+                **params
+            }
+
+            anim_response = await client.post(
+                f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/animation',
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=anim_payload,
+                timeout=30.0
+            )
+            anim_response.raise_for_status()
+            immersity_video_url = anim_response.json().get('resultPresignedUrl')
+
+            # 5. POLL Animation: Wait until video is done generating
+            is_anim_ready = await poll_presigned_url(client, immersity_video_url, max_retries=90)
+            if not is_anim_ready:
+                raise Exception("Animation video generation timed out.")
+
+            # 6. Push heavy processing (FFMPEG) to an isolated thread
+            await asyncio.to_thread(process_and_save_video, user_id, immersity_video_url, should_watermark)
+
+    except Exception as e:
+        print(f"❌ Background Orchestrator Failed: {e}")
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.id == user_id).first()
+            if user:
+                user.credits += COST_PER_GENERATION
+                db.commit()
+        finally:
+            db.close()
+
+
+# --- 4. THE FAST API ENDPOINTS ---
 @router.post("/generate-3d")
 async def generate_3d(
     background_tasks: BackgroundTasks,
@@ -177,7 +239,6 @@ async def generate_3d(
     if current_user.credits < COST_PER_GENERATION:
         raise HTTPException(status_code=402, detail="❌ Not enough credits.")
 
-    # Deduct credits upfront
     current_user.credits -= COST_PER_GENERATION
     db.commit()
 
@@ -188,63 +249,25 @@ async def generate_3d(
             
             file.file.seek(0)
             file_content = await file.read()
-            
             await client.put(upload_info['url'], content=file_content, headers={"Content-Type": file.content_type})
             
             input_image_url = upload_info['url']
-            correlation_id = str(uuid.uuid4())
 
-            disparity_payload = { "correlationId": correlation_id, "inputImageUrl": input_image_url }
-            disp_response = await client.post(
-                f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/disparity',
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json=disparity_payload,
-                timeout=60.0
-            )
-            if disp_response.status_code >= 400:
-                raise Exception(f"Immersity Disparity Error: {disp_response.text}")
-                
-            input_disparity_url = disp_response.json().get('resultPresignedUrl')
+        is_free_plan = current_user.plan.lower() == "free"
+        should_watermark = is_free_plan and current_user.subscription_status != "canceled"
 
-            # Configure Physics
-            intensity = max(min((float(depth) * (float(speed) / 5.0) * (float(duration) / 5.0)), 10.0), 0.5)
-            params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
-
-            if style == "Orbit":
-                params.update({"amplitudeX": intensity * 1.0, "amplitudeY": intensity * 0.5, "phaseY": 0.25})
-            elif style == "Dolly":
-                params.update({"amplitudeX": intensity * 0.8, "amplitudeZ": intensity * 0.3, "phaseX": 0.0})
-            elif style == "Zoom":
-                params.update({"amplitudeZ": intensity * 1.0, "amplitudeX": 0.0})
-
-            # Setup Webhook Parameters
-            is_free_plan = current_user.plan.lower() == "free"
-            is_ex_subscriber = current_user.subscription_status == "canceled"
-            should_watermark = is_free_plan and not is_ex_subscriber
-            
-            base_url = os.getenv("BASE_URL", "https://your-domain.com") 
-            webhook_url = f"{base_url}/ai/webhook/immersity?user_id={current_user.id}&watermark={'true' if should_watermark else 'false'}&token={WEBHOOK_SECRET}"
-
-            anim_payload = {
-                "correlationId": str(uuid.uuid4()),
-                "inputImageUrl": input_image_url,
-                "inputDisparityUrl": input_disparity_url,
-                "animationLength": float(duration), 
-                "webhookUrl": webhook_url, 
-                **params
-            }
-
-            anim_response = await client.post(
-                f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/animation',
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json=anim_payload,
-                timeout=30.0
-            )
-            
-            if anim_response.status_code >= 400:
-                raise Exception(f"Immersity Animation Error: {anim_response.text}")
-
-        # Queue file cleanup
+        # Queue the heavy lifting!
+        background_tasks.add_task(
+            background_generation_task,
+            user_id=current_user.id,
+            token=token,
+            input_image_url=input_image_url,
+            depth=depth,
+            speed=speed,
+            duration=duration,
+            style=style,
+            should_watermark=should_watermark
+        )
         background_tasks.add_task(cleanup_old_files)
 
         return {
@@ -254,61 +277,22 @@ async def generate_3d(
         }
 
     except Exception as e:
-        print(f"Server/Upstream Error: {e}")
-        # Refund credits if Immersity failed upfront
+        print(f"Server Error during Initialization: {e}")
         current_user.credits += COST_PER_GENERATION
         db.commit()
-        raise HTTPException(status_code=502, detail="Upstream AI provider failed. Your credits have been refunded.")
+        raise HTTPException(status_code=502, detail="Upstream file upload failed. Your credits have been refunded.")
 
-
-# --- 2. WEBHOOK LISTENER ---
-@router.post("/webhook/immersity")
-async def immersity_webhook(
-    request: Request,
-    user_id: int, 
-    watermark: str, 
-    token: str,
-    background_tasks: BackgroundTasks
-):
-    """Listens for completed videos from Immersity."""
-    if token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid webhook token")
-
-    payload = await request.json()
-    final_video_url = payload.get('resultPresignedUrl') 
-
-    if final_video_url:
-        should_watermark = watermark.lower() == 'true'
-        background_tasks.add_task(process_finished_video_no_db_state, user_id, should_watermark, final_video_url)
-    
-    return {"status": "received"}
-    
-
-# --- 3. GET HISTORY ---
 @router.get("/history")
-async def get_history(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    history = db.query(GenerationHistory)\
-        .filter(GenerationHistory.user_id == current_user.id)\
-        .order_by(GenerationHistory.created_at.desc())\
-        .limit(20)\
-        .all()
-    
+async def get_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    history = db.query(GenerationHistory).filter(GenerationHistory.user_id == current_user.id).order_by(GenerationHistory.created_at.desc()).limit(20).all()
     results = []
     for item in history:
-        expires_at = item.created_at + timedelta(minutes=30)
-        remaining = (expires_at - datetime.utcnow()).total_seconds()
-        
-        is_expired = remaining <= 0
-        
+        remaining = ((item.created_at + timedelta(minutes=30)) - datetime.utcnow()).total_seconds()
         results.append({
             "id": item.id,
             "video_url": item.video_url,
             "created_at": item.created_at.isoformat(),
             "expires_in_seconds": max(0, int(remaining)),
-            "is_expired": is_expired
+            "is_expired": remaining <= 0
         })
-        
     return results

@@ -261,11 +261,16 @@ async def generate_3d(
             token = await get_immersity_token(client)
             upload_info = await get_upload_url(client, token, file.filename, file.content_type)
             
+            # 1. Upload using the cryptographically signed PUT URL
+            full_put_url = upload_info['url']
             file.file.seek(0)
             file_content = await file.read()
-            await client.put(upload_info['url'], content=file_content, headers={"Content-Type": file.content_type})
+            await client.put(full_put_url, content=file_content, headers={"Content-Type": file.content_type})
             
-            input_image_url = upload_info['url']
+            # 2. Clean the URL for the Animation Workers
+            # We split at the '?' to remove the strict AWS PUT signature.
+            # This leaves the base S3 path which Immersity's workers can read.
+            clean_input_image_url = full_put_url.split('?')[0]
 
         is_free_plan = current_user.plan.lower() == "free"
         should_watermark = is_free_plan and current_user.subscription_status != "canceled"
@@ -273,8 +278,14 @@ async def generate_3d(
         # Queue the heavy lifting!
         background_tasks.add_task(
             background_generation_task,
-            user_id=current_user.id, token=token, input_image_url=input_image_url,
-            depth=depth, speed=speed, duration=duration, style=style, should_watermark=should_watermark
+            user_id=current_user.id,
+            token=token,
+            input_image_url=clean_input_image_url, # <-- Pass the cleaned URL here
+            depth=depth,
+            speed=speed,
+            duration=duration,
+            style=style,
+            should_watermark=should_watermark
         )
         background_tasks.add_task(cleanup_old_files)
 

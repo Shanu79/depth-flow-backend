@@ -41,21 +41,40 @@ async def get_upload_url(client: httpx.AsyncClient, token: str, filename: str, c
     return response.json()
 
 async def poll_presigned_url(client: httpx.AsyncClient, url: str, max_retries=60, sleep_time=2.0):
-    """
-    Checks if Immersity has finished writing the file to the S3 bucket.
-    Uses stream to check status without downloading the heavy video body.
-    """
     for _ in range(max_retries):
         try:
             async with client.stream("GET", url) as response:
                 if response.status_code == 200:
-                    return True
+                    content_length = int(response.headers.get("content-length", 0))
+                    if content_length > 1024: 
+                        return True
         except Exception:
             pass
         await asyncio.sleep(sleep_time)
     return False
 
+# --- NEW: RETRY LOGIC HELPER ---
+async def call_immersity_with_retry(client: httpx.AsyncClient, url: str, headers: dict, json_payload: dict, max_retries: int = 3):
+    """Wraps Immersity API calls in an exponential backoff retry loop for resilience against 500 errors."""
+    for attempt in range(max_retries):
+        response = await client.post(url, headers=headers, json=json_payload, timeout=30.0)
+        
+        # If successful or a client error (4xx like bad input), return immediately
+        if response.status_code < 500:
+            response.raise_for_status()
+            return response
+            
+        # If Immersity throws a 500, log it and retry
+        print(f"⚠️ Immersity API Error {response.status_code} on {url} (Attempt {attempt + 1}/{max_retries})")
+        if attempt == max_retries - 1:
+            response.raise_for_status() # Raise on the final failed attempt
+            
+        # Exponential backoff: sleep 1s, then 2s, etc.
+        await asyncio.sleep(2 ** attempt)
+
 # --- 2. SYNC VIDEO PROCESSING FUNCTIONS ---
+# ... (Keep save_video_direct, apply_watermark, process_and_save_video, and cleanup_old_files exactly the same as your previous code) ...
+
 def save_video_direct(input_url, output_path):
     try:
         with httpx.Client() as client:
@@ -88,16 +107,10 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
             return
 
         command = [
-            ffmpeg_exe, '-y',
-            '-i', temp_input, 
-            '-i', watermark_path,
+            ffmpeg_exe, '-y', '-i', temp_input, '-i', watermark_path,
             '-filter_complex', '[1:v][0:v]scale2ref[wm][vid];[vid][wm]overlay=0:0',
-            '-c:v', 'libx264', 
-            '-preset', 'ultrafast',  
-            '-threads', '1',         
-            '-c:a', 'copy',
-            '-max_muxing_queue_size', '1024', 
-            output_path
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1',         
+            '-c:a', 'copy', '-max_muxing_queue_size', '1024', output_path
         ]
         subprocess.run(command, check=True, capture_output=True)
         if os.path.exists(temp_input):
@@ -109,7 +122,6 @@ def apply_watermark(input_url, output_path, watermark_path="assets/watermark.png
             os.rename(temp_input, output_path)
 
 def process_and_save_video(user_id: int, immersity_video_url: str, should_watermark: bool):
-    """Handles FFMPEG processing and DB saving in a separate thread."""
     db = SessionLocal() 
     try:
         correlation_id = str(uuid.uuid4())
@@ -124,11 +136,7 @@ def process_and_save_video(user_id: int, immersity_video_url: str, should_waterm
         base_url = os.getenv("BASE_URL", "http://localhost:8000")
         final_url = f"{base_url}/static/{filename}"
 
-        new_history = GenerationHistory(
-            user_id=user_id,
-            video_url=final_url,
-            created_at=datetime.utcnow()
-        )
+        new_history = GenerationHistory(user_id=user_id, video_url=final_url, created_at=datetime.utcnow())
         db.add(new_history)
         db.commit()
 
@@ -137,6 +145,9 @@ def process_and_save_video(user_id: int, immersity_video_url: str, should_waterm
         user = db.query(User).filter(User.id == user_id).first()
         if user:
             user.credits += COST_PER_GENERATION
+            # Pass the error to the DB Workaround
+            error_msg = f"FAILED: Internal processing error. Your {COST_PER_GENERATION} credits have been refunded."
+            db.add(GenerationHistory(user_id=user_id, video_url=error_msg, created_at=datetime.utcnow()))
             db.commit()
     finally:
         db.close()
@@ -150,61 +161,52 @@ def cleanup_old_files(folder="static", age_limit=1800):
             try: os.remove(file_path)
             except: pass
 
+
 # --- 3. THE CORE BACKGROUND ORCHESTRATOR ---
 async def background_generation_task(
     user_id: int, token: str, input_image_url: str, 
     depth: int, speed: int, duration: int, style: str, should_watermark: bool
 ):
-    """
-    Runs fully in the background. Handles waiting for Immersity without blocking users.
-    """
     try:
         async with httpx.AsyncClient() as client:
-            # 1. Start Disparity
-            disp_response = await client.post(
-                f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/disparity',
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json={"correlationId": str(uuid.uuid4()), "inputImageUrl": input_image_url},
-                timeout=30.0
+            # 1. Start Disparity (WITH RETRIES)
+            disp_url = f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/disparity'
+            disp_payload = {"correlationId": str(uuid.uuid4()), "inputImageUrl": input_image_url}
+            
+            disp_response = await call_immersity_with_retry(
+                client, disp_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json_payload=disp_payload
             )
-            disp_response.raise_for_status()
             input_disparity_url = disp_response.json().get('resultPresignedUrl')
 
-            # 2. POLL Disparity: Wait until file actually exists
+            # 2. POLL Disparity
             is_disparity_ready = await poll_presigned_url(client, input_disparity_url)
             if not is_disparity_ready:
                 raise Exception("Disparity generation timed out.")
 
             # 3. Configure Physics
             intensity = max(min((float(depth) * (float(speed) / 5.0) * (float(duration) / 5.0)), 10.0), 0.5)
-            params = {"amplitudeX": 0, "amplitudeY": 0, "amplitudeZ": 0, "phaseX": 0, "phaseY": 0, "phaseZ": 0}
-
-            if style == "Orbit":
-                params.update({"amplitudeX": intensity * 1.0, "amplitudeY": intensity * 0.5, "phaseY": 0.25})
-            elif style == "Dolly":
-                params.update({"amplitudeX": intensity * 0.8, "amplitudeZ": intensity * 0.3, "phaseX": 0.0})
-            elif style == "Zoom":
-                params.update({"amplitudeZ": intensity * 1.0, "amplitudeX": 0.0})
-
-            # 4. Start Animation (Removed webhookUrl)
-            anim_payload = {
-                "correlationId": str(uuid.uuid4()),
-                "inputImageUrl": input_image_url,
-                "inputDisparityUrl": input_disparity_url,
-                "animationLength": float(duration), 
-                **params
+            params = {
+                "amplitudeX": 0.0, "amplitudeY": 0.0, "amplitudeZ": 0.0, 
+                "phaseX": 0.0, "phaseY": 0.0, "phaseZ": 0.0
             }
 
-            anim_response = await client.post(
-                f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/animation',
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json=anim_payload,
-                timeout=30.0
+            if style == "Orbit": params.update({"amplitudeX": intensity * 1.0, "amplitudeY": intensity * 0.5, "phaseY": 0.25})
+            elif style == "Dolly": params.update({"amplitudeX": intensity * 0.8, "amplitudeZ": intensity * 0.3, "phaseX": 0.0})
+            elif style == "Zoom": params.update({"amplitudeZ": intensity * 1.0, "amplitudeX": 0.0})
+
+            # 4. Start Animation (WITH RETRIES)
+            anim_url = f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/animation'
+            anim_payload = {
+                "correlationId": str(uuid.uuid4()), "inputImageUrl": input_image_url,
+                "inputDisparityUrl": input_disparity_url, "animationLength": float(duration), **params
+            }
+
+            anim_response = await call_immersity_with_retry(
+                client, anim_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json_payload=anim_payload
             )
-            anim_response.raise_for_status()
             immersity_video_url = anim_response.json().get('resultPresignedUrl')
 
-            # 5. POLL Animation: Wait until video is done generating
+            # 5. POLL Animation
             is_anim_ready = await poll_presigned_url(client, immersity_video_url, max_retries=90)
             if not is_anim_ready:
                 raise Exception("Animation video generation timed out.")
@@ -218,7 +220,19 @@ async def background_generation_task(
         try:
             user = db.query(User).filter(User.id == user_id).first()
             if user:
+                # Refund the user
                 user.credits += COST_PER_GENERATION
+                
+                # --- DB WORKAROUND FOR ERROR STATE ---
+                # We save the error message as the "video_url". 
+                # The frontend will read this and display an error card instead of a video player.
+                error_msg = f"FAILED: Third-party AI service is currently unavailable. Your {COST_PER_GENERATION} credits have been refunded."
+                new_history = GenerationHistory(
+                    user_id=user_id,
+                    video_url=error_msg,
+                    created_at=datetime.utcnow()
+                )
+                db.add(new_history)
                 db.commit()
         finally:
             db.close()
@@ -259,14 +273,8 @@ async def generate_3d(
         # Queue the heavy lifting!
         background_tasks.add_task(
             background_generation_task,
-            user_id=current_user.id,
-            token=token,
-            input_image_url=input_image_url,
-            depth=depth,
-            speed=speed,
-            duration=duration,
-            style=style,
-            should_watermark=should_watermark
+            user_id=current_user.id, token=token, input_image_url=input_image_url,
+            depth=depth, speed=speed, duration=duration, style=style, should_watermark=should_watermark
         )
         background_tasks.add_task(cleanup_old_files)
 
@@ -280,19 +288,29 @@ async def generate_3d(
         print(f"Server Error during Initialization: {e}")
         current_user.credits += COST_PER_GENERATION
         db.commit()
-        raise HTTPException(status_code=502, detail="Upstream file upload failed. Your credits have been refunded.")
+        raise HTTPException(
+            status_code=502, 
+            detail="The upstream AI provider is currently unreachable. Your credits have been refunded. Please try again later."
+        )
 
 @router.get("/history")
 async def get_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     history = db.query(GenerationHistory).filter(GenerationHistory.user_id == current_user.id).order_by(GenerationHistory.created_at.desc()).limit(20).all()
     results = []
+    
     for item in history:
         remaining = ((item.created_at + timedelta(minutes=30)) - datetime.utcnow()).total_seconds()
+        
+        # Parse our database workaround
+        is_failed = item.video_url.startswith("FAILED:")
+        
         results.append({
             "id": item.id,
-            "video_url": item.video_url,
+            "video_url": None if is_failed else item.video_url, # Hide the URL if it's an error string
+            "error_message": item.video_url.replace("FAILED: ", "") if is_failed else None,
+            "is_failed": is_failed,
             "created_at": item.created_at.isoformat(),
             "expires_in_seconds": max(0, int(remaining)),
-            "is_expired": remaining <= 0
+            "is_expired": remaining <= 0 and not is_failed # Failed records don't "expire"
         })
     return results

@@ -167,18 +167,37 @@ async def background_generation_task(
     user_id: int, token: str, input_image_url: str, 
     depth: int, speed: int, duration: int, style: str, should_watermark: bool
 ):
+    # --- HELPER TO UPDATE STATUS IN DB ---
+    def update_status(msg: str):
+        db = SessionLocal()
+        try:
+            db.add(GenerationHistory(user_id=user_id, video_url=f"STATUS:{msg}", created_at=datetime.utcnow()))
+            db.commit()
+        finally:
+            db.close()
+
     try:
         async with httpx.AsyncClient() as client:
-            # 1. Start Disparity (WITH RETRIES)
+            # 1. Start Disparity
+            update_status("Initiating Disparity Map...")
             disp_url = f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/disparity'
             disp_payload = {"correlationId": str(uuid.uuid4()), "inputImageUrl": input_image_url}
             
-            disp_response = await call_immersity_with_retry(
-                client, disp_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json_payload=disp_payload
-            )
+            # Custom Retry Logic for Disparity
+            for attempt in range(3):
+                disp_response = await client.post(disp_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=disp_payload, timeout=30.0)
+                if disp_response.status_code < 500:
+                    break
+                if attempt == 2:
+                    raise Exception("Disparity API failed after 3 attempts.")
+                update_status(f"Retrying Disparity (Attempt {attempt + 2}/3)...")
+                await asyncio.sleep(2 ** attempt)
+            
+            disp_response.raise_for_status()
             input_disparity_url = disp_response.json().get('resultPresignedUrl')
 
             # 2. POLL Disparity
+            update_status("Processing Disparity Map...")
             is_disparity_ready = await poll_presigned_url(client, input_disparity_url)
             if not is_disparity_ready:
                 raise Exception("Disparity generation timed out.")
@@ -189,29 +208,39 @@ async def background_generation_task(
                 "amplitudeX": 0.0, "amplitudeY": 0.0, "amplitudeZ": 0.0, 
                 "phaseX": 0.0, "phaseY": 0.0, "phaseZ": 0.0
             }
-
             if style == "Orbit": params.update({"amplitudeX": intensity * 1.0, "amplitudeY": intensity * 0.5, "phaseY": 0.25})
             elif style == "Dolly": params.update({"amplitudeX": intensity * 0.8, "amplitudeZ": intensity * 0.3, "phaseX": 0.0})
             elif style == "Zoom": params.update({"amplitudeZ": intensity * 1.0, "amplitudeX": 0.0})
 
-            # 4. Start Animation (WITH RETRIES)
+            # 4. Start Animation
+            update_status("Initiating Animation...")
             anim_url = f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/animation'
             anim_payload = {
                 "correlationId": str(uuid.uuid4()), "inputImageUrl": input_image_url,
                 "inputDisparityUrl": input_disparity_url, "animationLength": float(duration), **params
             }
 
-            anim_response = await call_immersity_with_retry(
-                client, anim_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json_payload=anim_payload
-            )
+             # Custom Retry Logic for Animation
+            for attempt in range(3):
+                anim_response = await client.post(anim_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=anim_payload, timeout=30.0)
+                if anim_response.status_code < 500:
+                    break
+                if attempt == 2:
+                    raise Exception("Animation API failed after 3 attempts.")
+                update_status(f"Retrying Animation (Attempt {attempt + 2}/3)...")
+                await asyncio.sleep(2 ** attempt)
+
+            anim_response.raise_for_status()
             immersity_video_url = anim_response.json().get('resultPresignedUrl')
 
             # 5. POLL Animation
+            update_status("Rendering Animation Video...")
             is_anim_ready = await poll_presigned_url(client, immersity_video_url, max_retries=90)
             if not is_anim_ready:
                 raise Exception("Animation video generation timed out.")
 
-            # 6. Push heavy processing (FFMPEG) to an isolated thread
+            # 6. Final Processing
+            update_status("Finalizing and Watermarking...")
             await asyncio.to_thread(process_and_save_video, user_id, immersity_video_url, should_watermark)
 
     except Exception as e:
@@ -220,19 +249,9 @@ async def background_generation_task(
         try:
             user = db.query(User).filter(User.id == user_id).first()
             if user:
-                # Refund the user
                 user.credits += COST_PER_GENERATION
-                
-                # --- DB WORKAROUND FOR ERROR STATE ---
-                # We save the error message as the "video_url". 
-                # The frontend will read this and display an error card instead of a video player.
-                error_msg = f"FAILED: Third-party AI service is currently unavailable. Your {COST_PER_GENERATION} credits have been refunded."
-                new_history = GenerationHistory(
-                    user_id=user_id,
-                    video_url=error_msg,
-                    created_at=datetime.utcnow()
-                )
-                db.add(new_history)
+                error_msg = f"FAILED: {str(e)}. Your {COST_PER_GENERATION} credits have been refunded."
+                db.add(GenerationHistory(user_id=user_id, video_url=error_msg, created_at=datetime.utcnow()))
                 db.commit()
         finally:
             db.close()
@@ -306,22 +325,25 @@ async def generate_3d(
 
 @router.get("/history")
 async def get_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    history = db.query(GenerationHistory).filter(GenerationHistory.user_id == current_user.id).order_by(GenerationHistory.created_at.desc()).limit(20).all()
+    # We fetch more items now because status updates create temporary rows
+    history = db.query(GenerationHistory).filter(GenerationHistory.user_id == current_user.id).order_by(GenerationHistory.created_at.desc()).limit(50).all()
     results = []
     
     for item in history:
         remaining = ((item.created_at + timedelta(minutes=30)) - datetime.utcnow()).total_seconds()
         
-        # Parse our database workaround
         is_failed = item.video_url.startswith("FAILED:")
+        is_status = item.video_url.startswith("STATUS:")
         
         results.append({
             "id": item.id,
-            "video_url": None if is_failed else item.video_url, # Hide the URL if it's an error string
+            "video_url": None if (is_failed or is_status) else item.video_url, 
             "error_message": item.video_url.replace("FAILED: ", "") if is_failed else None,
+            "status_message": item.video_url.replace("STATUS:", "") if is_status else None,
             "is_failed": is_failed,
+            "is_status": is_status,
             "created_at": item.created_at.isoformat(),
             "expires_in_seconds": max(0, int(remaining)),
-            "is_expired": remaining <= 0 and not is_failed # Failed records don't "expire"
+            "is_expired": remaining <= 0 and not is_failed and not is_status
         })
     return results

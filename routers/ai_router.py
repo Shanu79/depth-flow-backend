@@ -162,12 +162,10 @@ def cleanup_old_files(folder="static", age_limit=1800):
             except: pass
 
 
-# --- 3. THE CORE BACKGROUND ORCHESTRATOR ---
 async def background_generation_task(
-    user_id: int, token: str, input_image_url: str, 
+    user_id: int, token: str, file_bytes: bytes, mime_type: str, 
     depth: int, speed: int, duration: int, style: str, should_watermark: bool
 ):
-    # --- HELPER TO UPDATE STATUS IN DB ---
     def update_status(msg: str):
         db = SessionLocal()
         try:
@@ -178,23 +176,45 @@ async def background_generation_task(
 
     try:
         async with httpx.AsyncClient() as client:
-            # 1. Start Disparity
-            update_status("Initiating Disparity Map...")
+            # 1. Start Disparity via DIRECT FILE UPLOAD
+            update_status("Uploading image & Initiating Disparity...")
             disp_url = f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/disparity'
-            disp_payload = {"correlationId": str(uuid.uuid4()), "inputImageUrl": input_image_url}
+            correlation_id = str(uuid.uuid4())
             
-            # Custom Retry Logic for Disparity
+            # We must use multipart/form-data to send the file directly
+            files = {
+                'image': ('image.png', file_bytes, mime_type)
+            }
+            data = {
+                'correlationId': correlation_id
+            }
+            
+            # Note: Do not set Content-Type header when using 'files' in httpx. 
+            # httpx sets multipart boundary automatically.
+            headers = {"Authorization": f"Bearer {token}"}
+            
             for attempt in range(3):
-                disp_response = await client.post(disp_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=disp_payload, timeout=30.0)
+                # Using files= to force multipart/form upload
+                disp_response = await client.post(disp_url, headers=headers, data=data, files=files, timeout=45.0)
                 if disp_response.status_code < 500:
                     break
                 if attempt == 2:
                     raise Exception("Disparity API failed after 3 attempts.")
-                update_status(f"Retrying Disparity (Attempt {attempt + 2}/3)...")
+                update_status(f"Retrying Disparity Upload (Attempt {attempt + 2}/3)...")
                 await asyncio.sleep(2 ** attempt)
             
             disp_response.raise_for_status()
-            input_disparity_url = disp_response.json().get('resultPresignedUrl')
+            
+            # Since we uploaded the image directly, Immersity should return BOTH 
+            # the readable image URL and the new disparity map URL in the response.
+            response_data = disp_response.json()
+            
+            # Check docs for exact key names, but typically they return the hosted url of the input file
+            input_image_url = response_data.get('inputImageUrl') 
+            input_disparity_url = response_data.get('resultPresignedUrl')
+            
+            if not input_image_url:
+                raise Exception("Immersity did not return a hosted image URL.")
 
             # 2. POLL Disparity
             update_status("Processing Disparity Map...")
@@ -215,13 +235,15 @@ async def background_generation_task(
             # 4. Start Animation
             update_status("Initiating Animation...")
             anim_url = f'{MEDIA_CLOUD_REST_API_BASE_URL}/api/v1/animation'
+            
+            # We now pass the hosted input_image_url returned by Immersity itself
             anim_payload = {
                 "correlationId": str(uuid.uuid4()), "inputImageUrl": input_image_url,
                 "inputDisparityUrl": input_disparity_url, "animationLength": float(duration), **params
             }
 
-             # Custom Retry Logic for Animation
             for attempt in range(3):
+                # Back to JSON payload for animation
                 anim_response = await client.post(anim_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=anim_payload, timeout=30.0)
                 if anim_response.status_code < 500:
                     break
@@ -257,7 +279,6 @@ async def background_generation_task(
             db.close()
 
 
-# --- 4. THE FAST API ENDPOINTS ---
 @router.post("/generate-3d")
 async def generate_3d(
     background_tasks: BackgroundTasks,
@@ -276,30 +297,26 @@ async def generate_3d(
     db.commit()
 
     try:
+        # READ THE FILE BYTES
+        file.file.seek(0)
+        file_content = await file.read()
+        mime_type = file.content_type
+        
         async with httpx.AsyncClient() as client:
             token = await get_immersity_token(client)
-            upload_info = await get_upload_url(client, token, file.filename, file.content_type)
             
-            # 1. Upload using the cryptographically signed PUT URL
-            full_put_url = upload_info['url']
-            file.file.seek(0)
-            file_content = await file.read()
-            await client.put(full_put_url, content=file_content, headers={"Content-Type": file.content_type})
-            
-            # 2. Clean the URL for the Animation Workers
-            # We split at the '?' to remove the strict AWS PUT signature.
-            # This leaves the base S3 path which Immersity's workers can read.
-            clean_input_image_url = full_put_url.split('?')[0]
+            # NOTE: We completely remove the "get_upload_url" and AWS PUT code here.
 
         is_free_plan = current_user.plan.lower() == "free"
         should_watermark = is_free_plan and current_user.subscription_status != "canceled"
 
-        # Queue the heavy lifting!
+        # Queue the heavy lifting, passing the RAW BYTES instead of a URL
         background_tasks.add_task(
             background_generation_task,
             user_id=current_user.id,
             token=token,
-            input_image_url=clean_input_image_url, # <-- Pass the cleaned URL here
+            file_bytes=file_content, # NEW
+            mime_type=mime_type,     # NEW
             depth=depth,
             speed=speed,
             duration=duration,

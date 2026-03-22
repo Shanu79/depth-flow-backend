@@ -32,10 +32,7 @@ def cleanup_old_files(folder="static", age_limit=1800):
 @router.post("/generate-3d")
 async def generate_depthflow(
     file: UploadFile = File(...),
-    style: str = Form("dolly"),
-    depth: int = Form(5),    
-    speed: int = Form(5),    
-    duration: int = Form(5), 
+    payload: str = Form(...), 
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -49,19 +46,7 @@ async def generate_depthflow(
     output_path = f"static/{filename}"
 
     try:
-        engine_payload = {
-            "render": {"duration": int(duration), "fps": 30, "quality": 80},
-            "motion": {
-                "style": style.lower(), 
-                "amplitude": float(depth) / 5.0, 
-                "speed": float(speed) / 5.0, 
-                "focus": 0.5
-            },
-            "effects": {
-                "dof_enable": current_user.plan.lower() in ["pro", "basic"],
-                "vignette_enable": True
-            }
-        }
+        engine_payload = json.loads(payload)
 
         # Reset file pointer just in case it was read elsewhere
         file.file.seek(0)

@@ -11,7 +11,7 @@ from models import User, GenerationHistory
 from datetime import datetime
 from auth import get_current_user
 
-router = APIRouter(prefix="/depthflow", tags=["DepthFlow Generation"])
+router = APIRouter(prefix="/ai/depthflow", tags=["DepthFlow Generation"])
 
 # --- CONFIGURATION ---
 DEPTHFLOW_ENGINE_URL = os.getenv("DEPTHFLOW_ENGINE_URL")

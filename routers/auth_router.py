@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from fastapi_sso.sso.google import GoogleSSO
 from pathlib import Path
 from dotenv import load_dotenv
+import secrets # <-- Add this at the top with your other imports
 
 # --- NEW IMPORTS ---
 from database import get_db
@@ -186,5 +187,17 @@ def read_users_me(current_user: User = Depends(get_current_user)):
         "is_admin": current_user.is_admin,
         "subscription_status": current_user.subscription_status,
         "subscription_id": current_user.subscription_id,
-        "billing_cycle": current_user.billing_cycle
+        "billing_cycle": current_user.billing_cycle,
+        "api_key": current_user.api_key  # <-- ADD THIS LINE
     }
+    
+@router.post("/regenerate-api-key")
+def regenerate_api_key(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Generate a new secure 32-byte string
+    new_key = f"df_{secrets.token_urlsafe(32)}"
+    
+    # Save it to the database
+    current_user.api_key = new_key
+    db.commit()
+    
+    return {"status": "success", "api_key": new_key, "message": "API key regenerated successfully"}

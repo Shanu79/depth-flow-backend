@@ -16,7 +16,10 @@ router = APIRouter(prefix="/ai/depthflow", tags=["DepthFlow Generation"])
 # --- CONFIGURATION ---
 DEPTHFLOW_ENGINE_URL = os.getenv("DEPTHFLOW_ENGINE_URL")
 DEPTHFLOW_SECRET_KEY = os.getenv("DEPTHFLOW_SECRET_KEY", "your-super-secret-internal-key")
-COST_PER_GENERATION = 0
+
+# 1. ACTIVATED CREDIT COST
+# We use an environment variable so you can adjust pricing without changing code, defaulting to 20 credits.
+COST_PER_GENERATION = int(os.getenv("DEPTHFLOW_API_COST", 20)) 
 
 # --- HELPER FUNCTION ---
 def cleanup_old_files(folder="static", age_limit=1800): 
@@ -37,8 +40,12 @@ async def generate_depthflow(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    # 2. ENHANCED VALIDATION
     if current_user.credits < COST_PER_GENERATION:
-        raise HTTPException(status_code=402, detail="❌ Not enough credits.")
+        raise HTTPException(
+            status_code=402, 
+            detail=f"❌ Payment Required: This API call costs {COST_PER_GENERATION} credits. You currently have {current_user.credits} credits."
+        )
 
     correlation_id = str(uuid.uuid4())
     temp_raw_video = f"temp_raw_{correlation_id}.mp4"
@@ -72,18 +79,25 @@ async def generate_depthflow(
         new_history = GenerationHistory(user_id=current_user.id, video_url=final_url, created_at=datetime.utcnow())
         db.add(new_history)
         
-        background_tasks.add_task(cleanup_old_files)
+        # 3. DEDUCT CREDITS 
         current_user.credits -= COST_PER_GENERATION
-        db.commit()
+        
+        background_tasks.add_task(cleanup_old_files)
+        db.commit() # Saves the history AND the new credit balance
 
-        # Returns the actual file so the frontend/Swagger can download it easily
+        # 4. RETURN USAGE HEADERS
+        # For API-as-a-service, giving developers visibility into their balance via headers is a best practice.
         return FileResponse(
             path=output_path, 
             media_type="video/mp4", 
             filename=filename,
             headers={
-                "X-Status": "success", "X-Workspace": "depthflow", "X-Plan": current_user.plan,
-                "X-Remaining-Credits": str(current_user.credits), "X-History-ID": str(new_history.id),
+                "X-Status": "success", 
+                "X-Workspace": "depthflow", 
+                "X-Plan": current_user.plan,
+                "X-Cost": str(COST_PER_GENERATION),              # New: Inform what it cost
+                "X-Remaining-Credits": str(current_user.credits),# Updated remaining balance
+                "X-History-ID": str(new_history.id),
                 "X-Video-URL": final_url
             }
         )

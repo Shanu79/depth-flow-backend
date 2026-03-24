@@ -27,6 +27,8 @@ class User(Base):
     last_login_ip = Column(String, nullable=True)
     is_admin = Column(Boolean, default=False)
     
+    api_key = Column(String, unique=True, index=True, nullable=True)
+    
 class GenerationHistory(Base):
     __tablename__ = "generation_history"
 

@@ -36,6 +36,7 @@ def cleanup_old_files(folder="static", age_limit=1800):
 async def generate_depthflow(
     file: UploadFile = File(...),
     payload: str = Form(...), 
+    request_source: str = Form("api"),  # <--- NEW: Defaults to "api" if not provided
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -76,7 +77,13 @@ async def generate_depthflow(
         base_url = os.getenv("BASE_URL", "http://localhost:8000")
         final_url = f"{base_url}/static/{filename}"
 
-        new_history = GenerationHistory(user_id=current_user.id, video_url=final_url, created_at=datetime.utcnow())
+        # --- DYNAMIC SOURCE TAGGING ---
+        new_history = GenerationHistory(
+            user_id=current_user.id, 
+            video_url=final_url, 
+            created_at=datetime.utcnow(),
+            source=request_source  # <--- Saves "api" or "workspace" dynamically
+        )
         db.add(new_history)
         
         # 3. DEDUCT CREDITS 
@@ -86,7 +93,6 @@ async def generate_depthflow(
         db.commit() # Saves the history AND the new credit balance
 
         # 4. RETURN USAGE HEADERS
-        # For API-as-a-service, giving developers visibility into their balance via headers is a best practice.
         return FileResponse(
             path=output_path, 
             media_type="video/mp4", 
@@ -95,8 +101,8 @@ async def generate_depthflow(
                 "X-Status": "success", 
                 "X-Workspace": "depthflow", 
                 "X-Plan": current_user.plan,
-                "X-Cost": str(COST_PER_GENERATION),              # New: Inform what it cost
-                "X-Remaining-Credits": str(current_user.credits),# Updated remaining balance
+                "X-Cost": str(COST_PER_GENERATION), 
+                "X-Remaining-Credits": str(current_user.credits),
                 "X-History-ID": str(new_history.id),
                 "X-Video-URL": final_url
             }
@@ -111,16 +117,16 @@ async def generate_depthflow(
         if os.path.exists(temp_raw_video): os.remove(temp_raw_video)
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # --- NEW ENDPOINT: GET HISTORY ---
 @router.get("/logs")
 async def get_api_logs(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # Fetch user's generation history, ordered by newest first
+    # Fetch user's generation history, filter by API source, ordered by newest first
     history = db.query(GenerationHistory)\
         .filter(GenerationHistory.user_id == current_user.id)\
+        .filter(GenerationHistory.source == "api")\
         .order_by(GenerationHistory.created_at.desc())\
         .all()
     
@@ -128,11 +134,35 @@ async def get_api_logs(
     for item in history:
         # Format the data to match the frontend expectations
         logs.append({
-            "id": f"df_req_{item.id}{str(uuid.uuid4())[:4]}", # Simulated request ID
-            "status": "Success", # Only successful calls are saved in GenerationHistory currently
+            "id": f"df_req_{item.id}{str(uuid.uuid4())[:4]}", 
+            "status": "Success", 
             "credits": COST_PER_GENERATION,
-            "duration": "~1200ms", # Note: To make this real, you'd need to add a duration_ms column to GenerationHistory
+            "duration": "~1200ms", 
             "time": item.created_at.strftime("%b %d, %I:%M %p")
         })
         
     return logs
+
+@router.get("/billing")
+async def get_billing_info(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Returns the current user's subscription and credit ledger details.
+    """
+    # Format the date safely if it exists
+    end_date = None
+    if current_user.subscription_end_date:
+        # Formats to a nice readable string like "Oct 20, 2026" or an ISO string
+        end_date = current_user.subscription_end_date.strftime("%b %d, %Y")
+
+    return {
+        "plan": current_user.plan.capitalize() if current_user.plan else "Free",
+        "credits": current_user.credits,
+        "billing_cycle": current_user.billing_cycle or "None",
+        "status": current_user.subscription_status.capitalize() if current_user.subscription_status else "Inactive",
+        "next_billing_date": end_date or "N/A",
+        # A quick boolean for the frontend to check if features should be unlocked
+        "is_active": current_user.subscription_status == "active" 
+    }

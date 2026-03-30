@@ -38,6 +38,7 @@ class GenerationHistory(Base):
     # We calculate expiry based on created_at + 30 mins
     created_at = Column(DateTime, default=datetime.utcnow) 
     
+    source = Column(String, default="workspace")
     # Relationship to user
     owner = relationship("User", back_populates="generations")
 

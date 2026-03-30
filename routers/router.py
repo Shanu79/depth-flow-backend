@@ -1,14 +1,14 @@
 import os
 import uuid
 import time
-import httpx
+from datetime import datetime
 import json
+import httpx
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User, GenerationHistory
-from datetime import datetime
 from auth import get_current_user
 
 router = APIRouter(prefix="/ai/depthflow", tags=["DepthFlow Generation"])
@@ -110,3 +110,29 @@ async def generate_depthflow(
         print(f"Server Error (DepthFlow): {e}")
         if os.path.exists(temp_raw_video): os.remove(temp_raw_video)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- NEW ENDPOINT: GET HISTORY ---
+@router.get("/logs")
+async def get_api_logs(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Fetch user's generation history, ordered by newest first
+    history = db.query(GenerationHistory)\
+        .filter(GenerationHistory.user_id == current_user.id)\
+        .order_by(GenerationHistory.created_at.desc())\
+        .all()
+    
+    logs = []
+    for item in history:
+        # Format the data to match the frontend expectations
+        logs.append({
+            "id": f"df_req_{item.id}{str(uuid.uuid4())[:4]}", # Simulated request ID
+            "status": "Success", # Only successful calls are saved in GenerationHistory currently
+            "credits": COST_PER_GENERATION,
+            "duration": "~1200ms", # Note: To make this real, you'd need to add a duration_ms column to GenerationHistory
+            "time": item.created_at.strftime("%b %d, %I:%M %p")
+        })
+        
+    return logs

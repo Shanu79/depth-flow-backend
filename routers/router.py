@@ -149,20 +149,31 @@ async def get_billing_info(
     db: Session = Depends(get_db)
 ):
     """
-    Returns the current user's subscription and credit ledger details.
+    Returns the current user's Workspace and API subscription details.
     """
-    # Format the date safely if it exists
-    end_date = None
-    if current_user.subscription_end_date:
-        # Formats to a nice readable string like "Oct 20, 2026" or an ISO string
-        end_date = current_user.subscription_end_date.strftime("%b %d, %Y")
+    # Format the dates safely if they exist
+    platform_end_date = current_user.subscription_end_date.strftime("%b %d, %Y") if current_user.subscription_end_date else "N/A"
+    api_end_date = current_user.api_subscription_end_date.strftime("%b %d, %Y") if current_user.api_subscription_end_date else "N/A"
 
     return {
-        "plan": current_user.plan.capitalize() if current_user.plan else "Free",
+        # Shared Ledger
         "credits": current_user.credits,
-        "billing_cycle": current_user.billing_cycle or "None",
-        "status": current_user.subscription_status.capitalize() if current_user.subscription_status else "Inactive",
-        "next_billing_date": end_date or "N/A",
-        # A quick boolean for the frontend to check if features should be unlocked
-        "is_active": current_user.subscription_status == "active" 
+        
+        # Workspace/Platform Subscription Details
+        "platform": {
+            "plan": current_user.plan.capitalize() if current_user.plan else "Free",
+            "billing_cycle": current_user.billing_cycle or "None",
+            "status": current_user.subscription_status.capitalize() if current_user.subscription_status else "Inactive",
+            "next_billing_date": platform_end_date,
+            "is_active": current_user.subscription_status == "active" 
+        },
+        
+        # API Subscription Details
+        "api": {
+            "plan": current_user.api_plan.capitalize() if current_user.api_plan else "Free",
+            "billing_cycle": current_user.api_billing_cycle or "None",
+            "status": current_user.api_subscription_status.capitalize() if current_user.api_subscription_status else "Inactive",
+            "next_billing_date": api_end_date,
+            "is_active": current_user.api_subscription_status == "active" 
+        }
     }

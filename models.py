@@ -13,16 +13,21 @@ class User(Base):
     profile_pic = Column(String, nullable=True)
     provider = Column(String, default="local")
     
-    # --- SUBSCRIPTION TRACKING ---
-    plan = Column(String, default="free") # "Free", "Basic", "Pro"
-    billing_cycle = Column(String, nullable=True) # "monthly" or "yearly"
+    # --- WORKSPACE / PLATFORM SUBSCRIPTION ---
+    plan = Column(String, default="free") 
+    billing_cycle = Column(String, nullable=True) 
+    subscription_id = Column(String, nullable=True) 
+    subscription_status = Column(String, default="inactive") 
+    subscription_end_date = Column(DateTime, nullable=True) 
     
-    # Critical for managing access:
-    subscription_id = Column(String, nullable=True) # The ID from Dodo Payments
-    subscription_status = Column(String, default="inactive") # "active", "cancelled", "past_due"
-    subscription_end_date = Column(DateTime, nullable=True) # When does the plan expire?
+    # --- API SUBSCRIPTION (NEW FIELDS) ---
+    api_plan = Column(String, default="free") # "Free", "Api-Pro", etc.
+    api_billing_cycle = Column(String, nullable=True) 
+    api_subscription_id = Column(String, nullable=True) 
+    api_subscription_status = Column(String, default="inactive") 
+    api_subscription_end_date = Column(DateTime, nullable=True) 
     
-    # THE LEDGER
+    # THE LEDGER (Shared between platform and API)
     credits = Column(Integer, default=0)
     last_login_ip = Column(String, nullable=True)
     is_admin = Column(Boolean, default=False)

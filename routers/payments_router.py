@@ -43,9 +43,9 @@ PLAN_CONFIG = {
 # --- NEW: API PLANS ---
 API_PLAN_CONFIG = {
     "monthly": {
-        "Starter API": {"id": "dummy_api_starter_monthly", "credits": 10000},
-        "Growth API":  {"id": "dummy_api_growth_monthly", "credits": 27000},
-        "Pro API":     {"id": "dummy_api_pro_monthly", "credits": 60000},
+        "Starter API": {"id": "pdt_0Nbt4jmPtgBIPmJgF3qdh", "credits": 10000},
+        "Growth API":  {"id": "pdt_0NbtLLrNFAwrGkvpH0lGQ", "credits": 27000},
+        "Pro API":     {"id": "pdt_0Nbt4bIY0qlHH3u8SMyyD", "credits": 60000},
     },
     "yearly": {
         "Starter API": {"id": "dummy_api_starter_yearly", "credits": 120000},

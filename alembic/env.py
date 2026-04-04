@@ -1,7 +1,10 @@
+import sys
 import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 from dotenv import load_dotenv
-from database import Base, SQLALCHEMY_DATABASE_URL # Import your DB URL
-from models import User, GenerationHistory # Import all your models!
+from database import Base, SQLALCHEMY_DATABASE_URL
+from models import User, GenerationHistory
 
 # Load env vars
 load_dotenv()

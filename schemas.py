@@ -34,3 +34,7 @@ class UserResponse(BaseModel):
     subscription_id: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+class OTPVerify(BaseModel):
+    email: str
+    otp: str

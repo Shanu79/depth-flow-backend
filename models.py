@@ -34,6 +34,10 @@ class User(Base):
     
     api_key = Column(String, unique=True, index=True, nullable=True)
     
+    # Inside your User class in models.py add:
+    is_verified = Column(Boolean, default=False)
+    otp = Column(String, nullable=True)
+    otp_expiry = Column(DateTime, nullable=True)
 class GenerationHistory(Base):
     __tablename__ = "generation_history"
 

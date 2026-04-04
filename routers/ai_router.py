@@ -289,34 +289,44 @@ async def generate_3d(
         print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     
+
 # --- NEW ENDPOINT: GET HISTORY ---
 @router.get("/history")
 async def get_history(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # Fetch last 20 items, newest first
+    # 1. Define the cutoff time (30 minutes ago)
+    expiration_cutoff = datetime.utcnow() - timedelta(minutes=30)
+
+    # 2. LAZY CLEANUP: Delete expired records from the database for this user
+    # This keeps the DB perfectly in sync with your cache cleanup rule
+    db.query(GenerationHistory).filter(
+        GenerationHistory.user_id == current_user.id,
+        GenerationHistory.created_at <= expiration_cutoff
+    ).delete(synchronize_session=False)
+    
+    db.commit() # Commit the deletion
+
+    # 3. Fetch the remaining (active) items, newest first
     history = db.query(GenerationHistory)\
         .filter(GenerationHistory.user_id == current_user.id)\
         .order_by(GenerationHistory.created_at.desc())\
         .limit(20)\
         .all()
     
-    # Calculate expiry based on your 30 minute cleanup rule
     results = []
     for item in history:
-        # Calculate remaining seconds
+        # Calculate remaining seconds for the active videos
         expires_at = item.created_at + timedelta(minutes=30)
         remaining = (expires_at - datetime.utcnow()).total_seconds()
-        
-        is_expired = remaining <= 0
         
         results.append({
             "id": item.id,
             "video_url": item.video_url,
             "created_at": item.created_at.isoformat(),
             "expires_in_seconds": max(0, int(remaining)),
-            "is_expired": is_expired
+            "is_expired": False  # Will always be False now, since we deleted the expired ones
         })
         
     return results

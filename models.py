@@ -28,7 +28,7 @@ class User(Base):
     api_subscription_end_date = Column(DateTime, nullable=True) 
     
     # THE LEDGER (Shared between platform and API)
-    credits = Column(Integer, default=0)
+    credits = Column(Integer, default=20)
     last_login_ip = Column(String, nullable=True)
     is_admin = Column(Boolean, default=False)
     

@@ -31,12 +31,14 @@ client = DodoPayments(
 # SINGLE SOURCE OF TRUTH FOR CREDITS
 PLAN_CONFIG = {
     "monthly": {
-        "Basic": {"id": "pdt_0NUQxXnGKlkhrpGBAFMvy", "credits": 550},
-        "Pro":   {"id": "pdt_0NUQxXJa0TR6vJJznsrt2", "credits": 1200},
+        "Basic": {"id": "pdt_0NUQxXnGKlkhrpGBAFMvy", "credits": 850},
+        "Pro":   {"id": "pdt_0NUQxXJa0TR6vJJznsrt2", "credits": 2000},
+        "Premium":   {"id": "pdt_0Nc5Ts7erauRnehAFJV6Q", "credits": 5000},
     },
     "yearly": {
-        "Basic": {"id": "pdt_0NUQxWNFaRWTd8eoNkqoJ", "credits": 6600},
-        "Pro":   {"id": "pdt_0NUQxVyW088PIAwIzObuC", "credits": 14400},
+        "Basic": {"id": "pdt_0NUQxWNFaRWTd8eoNkqoJ", "credits": 10200},
+        "Pro":   {"id": "pdt_0NUQxVyW088PIAwIzObuC", "credits": 24000},
+        "Premium": {"id": "pdt_0Nc5TfN5t1oLCfoeNN7AZ", "credits": 60000},
     }
 }
 
@@ -44,8 +46,8 @@ PLAN_CONFIG = {
 API_PLAN_CONFIG = {
     "monthly": {
         "Starter API": {"id": "pdt_0Nbt4jmPtgBIPmJgF3qdh", "credits": 10000},
-        "Growth API":  {"id": "pdt_0NbtLLrNFAwrGkvpH0lGQ", "credits": 27000},
-        "Pro API":     {"id": "pdt_0Nbt4bIY0qlHH3u8SMyyD", "credits": 60000},
+        "Growth API":  {"id": "pdt_0NbtLLrNFAwrGkvpH0lGQ", "credits": 30000},
+        "Pro API":     {"id": "pdt_0Nbt4bIY0qlHH3u8SMyyD", "credits": 65000},
     },
     "yearly": {
         "Starter API": {"id": "dummy_api_starter_yearly", "credits": 120000},
@@ -55,7 +57,7 @@ API_PLAN_CONFIG = {
 }
 
 ONE_TIME_PLANS = {
-    "Trial": {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 120},
+    # "Trial": {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 120},
     "Credit Pack": {"id": "pdt_0NYCtBgPqWWzyF6yKrE98", "credits": 750},
 }
 

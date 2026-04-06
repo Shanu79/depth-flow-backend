@@ -1,6 +1,9 @@
 import os
 import uuid
 import time
+import subprocess
+import gc
+import imageio_ffmpeg
 from datetime import datetime
 import json
 import httpx
@@ -18,10 +21,9 @@ DEPTHFLOW_ENGINE_URL = os.getenv("DEPTHFLOW_ENGINE_URL")
 DEPTHFLOW_SECRET_KEY = os.getenv("DEPTHFLOW_SECRET_KEY", "your-super-secret-internal-key")
 
 # 1. ACTIVATED CREDIT COST
-# We use an environment variable so you can adjust pricing without changing code, defaulting to 20 credits.
 COST_PER_GENERATION = int(os.getenv("DEPTHFLOW_API_COST", 20)) 
 
-# --- HELPER FUNCTION ---
+# --- HELPER FUNCTIONS ---
 def cleanup_old_files(folder="static", age_limit=1800): 
     now = time.time()
     if not os.path.exists(folder): return
@@ -31,12 +33,58 @@ def cleanup_old_files(folder="static", age_limit=1800):
             try: os.remove(file_path)
             except: pass
 
+def apply_watermark_local(input_path, output_path, watermark_path="assets/watermark.png"):
+    """
+    Applies watermark to a local video file using FFmpeg.
+    """
+    # Force Garbage Collection before heavy FFmpeg process
+    gc.collect()
+
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        print(f"⚠️ FFmpeg binary not found. Saving original. Error: {e}")
+        os.rename(input_path, output_path)
+        return
+
+    if not os.path.exists(watermark_path):
+        print(f"⚠️ Watermark missing at {watermark_path}. Saving original.")
+        os.rename(input_path, output_path)
+        return
+
+    # [1:v][0:v]scale2ref[wm][vid] -> Scales watermark (1) to match video (0) dimensions
+    # [vid][wm]overlay=0:0 -> Applies scaled watermark over the video
+    command = [
+        ffmpeg_exe, '-y',
+        '-i', input_path, 
+        '-i', watermark_path,
+        '-filter_complex', '[1:v][0:v]scale2ref[wm][vid];[vid][wm]overlay=0:0',
+        '-c:v', 'libx264', 
+        '-preset', 'ultrafast',  
+        '-threads', '1',         
+        '-c:a', 'copy',
+        '-max_muxing_queue_size', '1024', 
+        output_path
+    ]
+
+    try:
+        subprocess.run(command, check=True, capture_output=True)
+        if os.path.exists(input_path):
+            os.remove(input_path)  # Cleanup the raw temp file
+    except Exception as e:
+        print(f"⚠️ Video Processing Failed: {str(e)}")
+        # Fallback: if FFmpeg fails, just give them the unwatermarked video so it doesn't break
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        os.rename(input_path, output_path)
+
+
 # --- THE ENDPOINT ---
 @router.post("/generate-3d")
 async def generate_depthflow(
     file: UploadFile = File(...),
     payload: str = Form(...), 
-    request_source: str = Form("api"),  # <--- NEW: Defaults to "api" if not provided
+    request_source: str = Form("api"),  
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -50,7 +98,12 @@ async def generate_depthflow(
 
     correlation_id = str(uuid.uuid4())
     temp_raw_video = f"temp_raw_{correlation_id}.mp4"
-    filename = f"depthflow_{correlation_id}_clean.mp4"
+    
+    # Check if the user should get a watermark
+    should_watermark = current_user.plan.lower() == "free"
+    
+    # Adjust filename based on status
+    filename = f"depthflow_{correlation_id}_{'branded' if should_watermark else 'clean'}.mp4"
     output_path = f"static/{filename}"
 
     try:
@@ -69,10 +122,16 @@ async def generate_depthflow(
             )
             response.raise_for_status()
 
+            # Save the raw response temporarily
             with open(temp_raw_video, 'wb') as f:
                 f.write(response.content)
 
-        os.rename(temp_raw_video, output_path)
+        # --- WATERMARK LOGIC INJECTION ---
+        if should_watermark:
+            apply_watermark_local(temp_raw_video, output_path)
+        else:
+            # If not free plan, just rename the temp file to the final output path
+            os.rename(temp_raw_video, output_path)
 
         base_url = os.getenv("BASE_URL", "http://localhost:8000")
         final_url = f"{base_url}/static/{filename}"
@@ -82,7 +141,7 @@ async def generate_depthflow(
             user_id=current_user.id, 
             video_url=final_url, 
             created_at=datetime.utcnow(),
-            source=request_source  # <--- Saves "api" or "workspace" dynamically
+            source=request_source  
         )
         db.add(new_history)
         

@@ -89,11 +89,29 @@ async def generate_depthflow(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    # 1. PARSE PAYLOAD FIRST TO DETERMINE DYNAMIC COST
+    try:
+        engine_payload = json.loads(payload)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid payload format.")
+
+    # Extract duration from the payload (defaults to 5 if not provided)
+    render_settings = engine_payload.get("render", {})
+    duration = render_settings.get("duration", 5)
+
+    # Calculate dynamic cost matching the frontend logic
+    # Base cost + (10 if duration > 20 else 5 if duration > 10 else 0)
+    dynamic_cost = COST_PER_GENERATION
+    if duration > 20:
+        dynamic_cost += 10
+    elif duration > 10:
+        dynamic_cost += 5
+
     # 2. ENHANCED VALIDATION
-    if current_user.credits < COST_PER_GENERATION:
+    if current_user.credits < dynamic_cost:
         raise HTTPException(
             status_code=402, 
-            detail=f"❌ Payment Required: This API call costs {COST_PER_GENERATION} credits. You currently have {current_user.credits} credits."
+            detail=f"❌ Payment Required: This API call costs {dynamic_cost} credits. You currently have {current_user.credits} credits."
         )
 
     correlation_id = str(uuid.uuid4())
@@ -107,8 +125,6 @@ async def generate_depthflow(
     output_path = f"static/{filename}"
 
     try:
-        engine_payload = json.loads(payload)
-
         # Reset file pointer just in case it was read elsewhere
         file.file.seek(0)
         file_content = await file.read()
@@ -145,8 +161,8 @@ async def generate_depthflow(
         )
         db.add(new_history)
         
-        # 3. DEDUCT CREDITS 
-        current_user.credits -= COST_PER_GENERATION
+        # 3. DEDUCT DYNAMIC CREDITS 
+        current_user.credits -= dynamic_cost
         
         background_tasks.add_task(cleanup_old_files)
         db.commit() # Saves the history AND the new credit balance
@@ -160,7 +176,7 @@ async def generate_depthflow(
                 "X-Status": "success", 
                 "X-Workspace": "depthflow", 
                 "X-Plan": current_user.plan,
-                "X-Cost": str(COST_PER_GENERATION), 
+                "X-Cost": str(dynamic_cost),  # <-- Return the dynamic cost to frontend
                 "X-Remaining-Credits": str(current_user.credits),
                 "X-History-ID": str(new_history.id),
                 "X-Video-URL": final_url

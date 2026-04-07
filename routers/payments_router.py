@@ -70,14 +70,14 @@ class CheckoutRequest(BaseModel):
 def check_if_already_purchased(email: str, product_id: str) -> bool:
     try:
         # 1. Get Customer ID first
-        customers = client.customers.list(email=email, limit=1)
+        customers = client.customers.list(email=email)
         if not customers.items:
             return False # Customer doesn't exist, so they haven't bought anything
         
         customer_id = customers.items[0].customer_id
 
         # 2. List payments using the ID string
-        payments = client.payments.list(customer_id=customer_id, limit=100)
+        payments = client.payments.list(customer_id=customer_id)
 
         for payment in payments.items: 
             if payment.product_id == product_id and payment.status == "succeeded":
@@ -111,7 +111,6 @@ async def create_checkout_session(
         
         target_product_id = plan_data["id"]
 
-        # --- LOGIC A.1: HISTORY CHECK (Trial) ---
         if request.plan_name == "Trial":
             if current_user.plan == "Trial":
                 raise HTTPException(status_code=403, detail="You already have the Trial pack.")
@@ -120,8 +119,6 @@ async def create_checkout_session(
             if already_bought:
                 raise HTTPException(status_code=403, detail="You have already used the Trial pack in the past.")
 
-        # --- LOGIC A.2: SUBSCRIPTION CHECK (Credit Pack) ---
-        # User must have an active subscription to buy add-on credits
         if request.plan_name == "Credits Pack":
             has_workspace = current_user.subscription_id and current_user.subscription_status == "active"
             has_api = current_user.api_subscription_id and current_user.api_subscription_status == "active"
@@ -136,7 +133,6 @@ async def create_checkout_session(
 
     # CASE B: RECURRING SUBSCRIPTION
     else:
-        # Minimal Check: Is it Workspace or API?
         if request.billing_cycle in PLAN_CONFIG and request.plan_name in PLAN_CONFIG[request.billing_cycle]:
             plan_data = PLAN_CONFIG[request.billing_cycle][request.plan_name]
         elif request.billing_cycle in API_PLAN_CONFIG and request.plan_name in API_PLAN_CONFIG[request.billing_cycle]:
@@ -148,7 +144,7 @@ async def create_checkout_session(
         target_product_id = plan_data["id"]
         credits_to_add = plan_data["credits"]
 
-    # Define active status safely based on plan type
+    # Grab the old sub ID so we can cancel it AFTER they pay for the new one
     if is_api_plan:
         current_status = current_user.api_subscription_status or ""
         sub_id = current_user.api_subscription_id
@@ -157,95 +153,53 @@ async def create_checkout_session(
         sub_id = current_user.subscription_id
         
     has_active_sub = sub_id and (current_status == "active" or "Scheduled for cancellation" in current_status)
+    old_sub_id = sub_id if has_active_sub and not is_one_time else ""
 
     # ---------------------------------------------------------
-    # STEP 2: EXECUTE PAYMENT
+    # STEP 2: EXECUTE PAYMENT (Always Checkout to reset cycle)
     # ---------------------------------------------------------
     
     try:
-        # --- SCENARIO A: MODIFY EXISTING SUBSCRIPTION ---
-        # Only if user has active sub AND this is NOT a one-time purchase
-        if has_active_sub and not is_one_time:
-            
-            # 1. Reactivate if needed
-            if "Scheduled for cancellation" in current_status:
-                try:
-                    client.subscriptions.update(
-                        subscription_id=sub_id,
-                        cancel_at_next_billing_date=False 
-                    )
-                except Exception:
-                    pass 
+        # We pass old_sub_id in metadata. If the user closes the checkout tab, 
+        # nothing happens and their current plan remains safely active.
+        metadata = {
+            "user_id": str(current_user.id),
+            "credits_to_add": str(credits_to_add),
+            "plan_name": request.plan_name,
+            "billing_cycle": request.billing_cycle,
+            "is_one_time": "true" if is_one_time else "false",
+            "is_api": "true" if is_api_plan else "false",
+            "old_sub_id": old_sub_id 
+        }
 
-            # 2. Change Plan
-            try:
-                updated_sub = client.subscriptions.change_plan(
-                    subscription_id=sub_id,
-                    product_id=target_product_id,
-                    proration_billing_mode="prorated_immediately",
-                    quantity=request.quantity
-                )
-            except Exception as e:
-                error_str = str(e)
-                if "PREVIOUS_PAYMENT_PENDING" in error_str or "409" in error_str:
-                    logger.warning(f"409 Error for user {current_user.id}: Pending Payment")
-                    raise HTTPException(
-                        status_code=409, 
-                        detail="A previous payment is currently processing. Please wait a few minutes for it to settle before changing plans."
-                    )
-                else:
-                    raise e 
+        # --- FIX 2: PREVENT DUPLICATE CUSTOMER PROFILES ---
+        customer_payload = {
+            "email": current_user.email,
+            "name": current_user.full_name or "User"
+        }
+        try:
+            # Query Dodo to see if this email already belongs to a customer
+            existing_customers = client.customers.list(email=current_user.email)
+            if existing_customers.items:
+                # Use the existing customer ID instead of sending the dictionary
+                customer_payload = {"customer_id": existing_customers.items[0].customer_id}
+        except Exception as e:
+            logger.warning(f"Could not search for existing Dodo customer: {e}")
 
-            # 3. IMMEDIATE DB UPDATE
-            if is_api_plan:
-                current_user.api_plan = request.plan_name
-                current_user.api_billing_cycle = request.billing_cycle
-                current_user.api_subscription_status = "active"
-            else:
-                current_user.plan = request.plan_name
-                current_user.billing_cycle = request.billing_cycle
-                current_user.subscription_status = "active"
-            
-            next_date = getattr(updated_sub, 'next_billing_date', None)
-            formatted_date = str(next_date)[:10] if next_date else "next billing cycle"
-
-            db.commit()
-            
-            return {
-                "action": "updated",
-                "message": f"Plan upgraded to {request.plan_name}. Active now. Next billing: {formatted_date}",
-                "checkout_url": None
-            }
-
-        # --- SCENARIO B: NEW CHECKOUT (New Sub OR One-Time) ---
-        else:
-            # We construct metadata to handle both cases
-            metadata = {
-                "user_id": str(current_user.id),
-                "credits_to_add": str(credits_to_add),
-                "plan_name": request.plan_name,
-                "billing_cycle": request.billing_cycle,
-                "is_one_time": "true" if is_one_time else "false",
-                "is_api": "true" if is_api_plan else "false" # <--- Added flag
-            }
-
-            logger.info(f"🛒 GENERATING CHECKOUT FOR: {target_product_id}")
-            
-            return_url = f"{FRONTEND_URL}/api-pricing" if is_api_plan else f"{FRONTEND_URL}/workspace"
-            
-            session = client.checkout_sessions.create(
-                product_cart=[{
-                    "product_id": target_product_id, 
-                    "quantity": request.quantity
-                }],
-                customer={
-                    "email": current_user.email,
-                    "name": current_user.full_name or "User"
-                },
-                metadata=metadata,
-                return_url=return_url, 
-            )
-            return {"action": "checkout", "checkout_url": session.checkout_url}
+        logger.info(f"🛒 GENERATING CHECKOUT FOR: {target_product_id}")
+        
+        return_url = f"{FRONTEND_URL}/api-pricing" if is_api_plan else f"{FRONTEND_URL}/workspace"
+        
+        session = client.checkout_sessions.create(
+            product_cart=[{
+                "product_id": target_product_id, 
+                "quantity": request.quantity
+            }],
+            customer=customer_payload,  # <-- Injected safe payload here
+            metadata=metadata,
+            return_url=return_url, 
+        )
+        return {"action": "checkout", "checkout_url": session.checkout_url}
 
     except HTTPException as he:
         raise he 
@@ -321,6 +275,7 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
         if event_type == "payment.succeeded":
             metadata = data.get("metadata", {})
             user_id = metadata.get("user_id")
+            payment_id = data.get("payment_id", data.get("id")) # Get unique payment ID
             
             # 1. Identify User
             user = None
@@ -337,13 +292,19 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                 
                 is_renewal = (user.api_subscription_id == new_sub_id) if is_api else (user.subscription_id == new_sub_id)
 
+                # --- FIX 3: IDEMPOTENCY CHECK (PREVENT DOUBLE CREDITS) ---
+                if payment_id and hasattr(user, "last_payment_id"):
+                    if user.last_payment_id == payment_id and not is_renewal:
+                        logger.info(f"Duplicate webhook ignored for payment: {payment_id}")
+                        return {"status": "ignored", "message": "Duplicate payment webhook"}
+
                 # --- 2. DETERMINE CREDITS ---
                 credits_to_add = 0
                 source = "Unknown"
 
                 if "credits_to_add" in metadata:
                     credits_to_add = int(metadata.get("credits_to_add"))
-                    source = "Metadata (New/One-Time)"
+                    source = "Metadata (New/One-Time/Upgrade)"
                 elif is_renewal:
                     config_map = API_PLAN_CONFIG if is_api else PLAN_CONFIG
                     active_cycle = user.api_billing_cycle if is_api else user.billing_cycle
@@ -354,12 +315,19 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                     credits_to_add = current_plan.get("credits", 0)
                     source = f"Auto-Renewal ({active_plan})"
 
-                # --- 3. ADD CREDITS ---
+                # --- 3. ADD / RESET CREDITS ---
                 if credits_to_add > 0:
-                    user.credits += credits_to_add 
-                    logger.info(f"ADDED {credits_to_add} CREDITS to User {user.email}. Source: {source}")
+                    if is_renewal:
+                        # USE IT OR LOSE IT: Auto-renewal resets the balance.
+                        # This automatically expires unused plan credits AND add-on credits.
+                        user.credits = credits_to_add 
+                        logger.info(f"RENEWAL: Reset User {user.email} balance to {credits_to_add}. Old credits expired.")
+                    else:
+                        # UPGRADES / CREDIT PACKS / NEW SUBS: Add on top of current balance
+                        user.credits += credits_to_add 
+                        logger.info(f"ADDED {credits_to_add} CREDITS to User {user.email}. Source: {source}")
 
-                # --- 4. SYNC STATE (PROTECTED) ---
+                # --- 4. SYNC STATE (SAVE NEW SUB ID) ---
                 if is_one_time:
                     if not user.subscription_id or user.subscription_status != "active":
                          user.plan = metadata.get("plan_name", user.plan)
@@ -377,7 +345,24 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                         if metadata.get("plan_name"): user.plan = metadata["plan_name"]
                         if metadata.get("billing_cycle"): user.billing_cycle = metadata["billing_cycle"]
 
-                db.commit()
+                # Log the successful payment ID for idempotency
+                if payment_id and hasattr(user, "last_payment_id"):
+                    user.last_payment_id = payment_id
+
+                db.commit() # Important: Commit the NEW sub_id first
+
+                # --- 5. CLEANUP OLD SUBSCRIPTION ---
+                old_sub_id = metadata.get("old_sub_id")
+                if old_sub_id and old_sub_id != new_sub_id:
+                    try:
+                        # FIX: Use the SDK's supported update method to schedule the cancellation
+                        client.subscriptions.update(
+                            subscription_id=old_sub_id,
+                            cancel_at_next_billing_date=True
+                        )
+                        logger.info(f"Cancelled old subscription {old_sub_id} to prevent double billing.")
+                    except Exception as e:
+                        logger.error(f"Failed to cancel old sub {old_sub_id}: {e}")
 
         # --- EVENT: SUBSCRIPTION UPDATED ---
         elif event_type == "subscription.updated":
@@ -520,7 +505,7 @@ async def sync_subscription(
         print(f"SYNC ERROR: {e}")
         logger.error(f"Sync Failed: {e}")
         if "404" in str(e):
-             user_db.subscription_status = "canceled"
+             user_db.subscription_status = "cancelled"
              user_db.subscription_id = None
              db.commit()
              return {"status": "success", "message": "Subscription was deleted remotely."}
@@ -532,12 +517,12 @@ async def get_payment_history(
     current_user: User = Depends(get_current_user)
 ):
     try:
-        customers = client.customers.list(email=current_user.email, limit=1)
+        customers = client.customers.list(email=current_user.email)
         if not customers.items:
             return [] 
         
         customer_id = customers.items[0].customer_id
-        payments = client.payments.list(customer_id=customer_id, limit=20)
+        payments = client.payments.list(customer_id=customer_id)
         
         history = []
         for payment in payments.items:

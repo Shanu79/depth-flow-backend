@@ -18,7 +18,8 @@ class User(Base):
     billing_cycle = Column(String, nullable=True) 
     subscription_id = Column(String, nullable=True) 
     subscription_status = Column(String, default="inactive") 
-    subscription_end_date = Column(DateTime, nullable=True) 
+    subscription_end_date = Column(DateTime, nullable=True)
+    last_payment_id = Column(String, nullable=True)
     
     # --- API SUBSCRIPTION (NEW FIELDS) ---
     api_plan = Column(String, default="free") # "Free", "Api-Pro", etc.

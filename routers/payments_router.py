@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Request
@@ -317,15 +317,33 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
 
                 # --- 3. ADD / RESET CREDITS ---
                 if credits_to_add > 0:
+                    
+                    # 1. Determine if this is a yearly subscription payment
+                    active_cycle = metadata.get("billing_cycle") or (user.api_billing_cycle if is_api else user.billing_cycle)
+                    is_yearly_sub = (active_cycle == "yearly") and not is_one_time
+                    
+                    actual_credits = credits_to_add
+                    
+                    # 2. Modify drop amounts and set schedule if yearly
+                    if is_yearly_sub:
+                        actual_credits = credits_to_add // 12
+                        
+                        # Set the next drop date to 30 days from now (requires timedelta import at the top)
+                        user.next_credit_drop_date = datetime.utcnow() + timedelta(days=30)
+                        source += " (1/12th Monthly Drop)"
+                    elif not is_one_time:
+                        # Clear the drop date if they switched to a monthly plan
+                        user.next_credit_drop_date = None
+
+                    # 3. Apply credits
                     if is_renewal:
-                        # USE IT OR LOSE IT: Auto-renewal resets the balance.
-                        # This automatically expires unused plan credits AND add-on credits.
-                        user.credits = credits_to_add 
-                        logger.info(f"RENEWAL: Reset User {user.email} balance to {credits_to_add}. Old credits expired.")
+                        # USE IT OR LOSE IT: Reset the balance
+                        user.credits = actual_credits 
+                        logger.info(f"RENEWAL: Reset User {user.email} balance to {actual_credits}. Old credits expired.")
                     else:
-                        # UPGRADES / CREDIT PACKS / NEW SUBS: Add on top of current balance
-                        user.credits += credits_to_add 
-                        logger.info(f"ADDED {credits_to_add} CREDITS to User {user.email}. Source: {source}")
+                        # UPGRADES / CREDIT PACKS / NEW SUBS: Add on top
+                        user.credits += actual_credits 
+                        logger.info(f"ADDED {actual_credits} CREDITS to User {user.email}. Source: {source}")
 
                 # --- 4. SYNC STATE (SAVE NEW SUB ID) ---
                 if is_one_time:
@@ -419,6 +437,7 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                 
                 # ZERO OUT CREDITS
                 user.credits = 0 
+                user.next_credit_drop_date = None # <-- MAKE SURE THIS LINE IS HERE
                 db.commit()
 
         return {"status": "received"}

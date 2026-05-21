@@ -10,7 +10,7 @@ from standardwebhooks.webhooks import Webhook
 # ==========================================
 BASE_URL = "http://localhost:8000"
 # Get a valid JWT token from a logged-in test user
-ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJkdW1teV90ZXN0ZXJAZXhhbXBsZS5jb20iLCJleHAiOjE3NzYxODk3MDF9.1FC_NLz7YdPKLjpwN8KdX_dkxgWEjBt1YV3oeZFg8cQ" 
+ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyQGV4YW1wbGUuY29tIiwiZXhwIjoxNzc5ODIyNjg5fQ.Vv1LAMvReWsM_iLxwHewdhaEGTuGK1_ZQacAKoad5e4" 
 # Your local Dodo Webhook Secret (from your .env)
 WEBHOOK_SECRET = "whsec_BjJ521s4BJnSWdfMndLthomoC0SIL9Ie"
 
@@ -177,7 +177,7 @@ def run_tests():
     print(f"Response: {res.json()}")
     
     # ---------------------------------------------------------
-    # TEST 8: SWITCH TO YEARLY PLAN
+    # TEST 8: SWITCH TO YEARLY PLAN (DRIP FEED)
     # ---------------------------------------------------------
     print("\n--- TEST 8: User switches to Yearly Pro Plan ---")
     sub_yearly_id = f"sub_test_{uuid.uuid4().hex[:8]}"
@@ -188,34 +188,32 @@ def run_tests():
         "customer": {"email": user_email},
         "metadata": {
             "user_id": str(user_id),
-            "credits_to_add": "18000", # The upfront bulk yearly credits
+            "credits_to_add": "18000", # The webhook should now intercept this and divide by 12
             "plan_name": "Pro",
             "billing_cycle": "yearly",
             "is_one_time": "false",
             "is_api": "false",
-            "old_sub_id": "sub_test_0bc73c8b" # (Or whatever the previous active sub was)
+            "old_sub_id": "sub_test_0bc73c8b" 
         }
     })
 
     user = get_user_state()
-    print(f"State after Yearly Upgrade: {user['credits']} Credits | Plan: {user['plan']} | Cycle: {user['billing_cycle']}")
+    # Expectation changed: 18000 / 12 = 1500
+    print(f"State after Yearly Upgrade: {user['credits']} Credits (Should be 1500 - 1/12th drop) | Plan: {user['plan']} | Cycle: {user['billing_cycle']}")
 
     # ---------------------------------------------------------
     # TEST 9: YEARLY AUTO-RENEWAL (1 Year Later)
     # ---------------------------------------------------------
     print("\n--- TEST 9: Auto-Renewal for Yearly Sub (1 Year Later) ---")
-    # Mimicking an auto-renewal where Dodo doesn't attach checkout metadata.
-    # Your webhook must dynamically look up the user's cycle ("yearly") 
-    # and grant the 18000 credits using `PLAN_CONFIG`.
+    # Mimicking an auto-renewal where Dodo hits the webhook.
     trigger_mock_webhook("payment.succeeded", {
-        "subscription_id": sub_yearly_id, # Matches the current active yearly sub ID
+        "subscription_id": sub_yearly_id, 
         "customer": {"email": user_email}
     })
     
     user = get_user_state()
-    print(f"State after Yearly Auto-Renewal: {user['credits']} Credits (Should have added exactly 18000)")
-    
-    
+    # The renewal resets the cycle, dropping the first month of the new year
+    print(f"State after Yearly Auto-Renewal: {user['credits']} Credits (Should be reset to 1500)")
     # ---------------------------------------------------------
     # TEST 10: BUY ADD-ON CREDIT PACK
     # ---------------------------------------------------------
@@ -238,19 +236,19 @@ def run_tests():
     user = get_user_state()
     print(f"State after Add-on: {user['credits']} Credits (Should have added 900 to the pile)")
 
-    # ---------------------------------------------------------
+   # ---------------------------------------------------------
     # TEST 11: THE EXPIRATION EVENT (Auto-Renewal)
     # ---------------------------------------------------------
     print("\n--- TEST 11: Auto-Renewal (Testing Credit Expiration) ---")
-    print("-> This should wipe out the massive pile of old credits and the add-on, resetting to 18000.")
-    # Mimicking an auto-renewal where Dodo hits the webhook
+    print("-> This should wipe out the old credits and the add-on, resetting to the monthly drop limit.")
+    
     trigger_mock_webhook("payment.succeeded", {
-        "subscription_id": sub_yearly_id, # Matches the active yearly sub ID from Test 8
+        "subscription_id": sub_yearly_id, 
         "customer": {"email": user_email}
     })
     
     user = get_user_state()
-    print(f"State after Expiration/Renewal: {user['credits']} Credits (Should be EXACTLY 18000)")
+    print(f"State after Expiration/Renewal: {user['credits']} Credits (Should be EXACTLY 1500)")
 
     # ---------------------------------------------------------
     # TEST 12: WEBHOOK IDEMPOTENCY (Prevent Double Credits)

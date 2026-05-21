@@ -39,6 +39,9 @@ class User(Base):
     is_verified = Column(Boolean, default=False)
     otp = Column(String, nullable=True)
     otp_expiry = Column(DateTime, nullable=True)
+    
+    # --- ADD THIS NEW FIELD ---
+    next_credit_drop_date = Column(DateTime, nullable=True)
 class GenerationHistory(Base):
     __tablename__ = "generation_history"
 

@@ -21,6 +21,10 @@ from auth import (
     verify_password 
 )
 
+from pydantic import BaseModel
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 # Force Load Env
@@ -323,6 +327,83 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    
+# Schema for incoming Android payload
+class GoogleTokenReq(BaseModel):
+    id_token: str
+
+# ==========================================
+# 3b. GOOGLE ID TOKEN VERIFICATION (For Mobile / API)
+# ==========================================
+@router.post("/google/verify")
+def verify_google_token(token_data: GoogleTokenReq, db: Session = Depends(get_db)):
+    """
+    Accepts a Google ID Token from an Android/iOS/Web client, verifies it, 
+    and returns a standard JWT access token. Seamlessly merges accounts.
+    """
+    try:
+        # 1. Verify the token with Google's servers
+        idinfo = id_token.verify_oauth2_token(
+            token_data.id_token, 
+            google_requests.Request(), 
+            GOOGLE_CLIENT_ID
+        )
+
+        # 2. Extract verified user info
+        email = idinfo['email']
+        full_name = idinfo.get('name', 'User')
+        picture = idinfo.get('picture', None)
+
+        # 3. Look up user in our database
+        db_user = db.query(User).filter(User.email == email).first()
+
+        if not db_user:
+            # BRAND NEW USER: Create them
+            db_user = User(
+                email=email,
+                full_name=full_name,
+                profile_pic=picture,
+                provider="google",
+                plan="Free",
+                subscription_status="active",
+                billing_cycle="monthly",
+                is_verified=True # Google guarantees the email is real
+            )
+            db.add(db_user)
+            db.commit()
+            db.refresh(db_user)
+        else:
+            # EXISTING USER: Syncing flow
+            # If they registered via Email but are now using Google, we automatically 
+            # mark them as verified since Google vouches for their email.
+            dirty = False
+            if not db_user.is_verified:
+                db_user.is_verified = True
+                dirty = True
+            
+            # Optionally sync their profile picture if they didn't have one
+            if not db_user.profile_pic and picture:
+                db_user.profile_pic = picture
+                dirty = True
+                
+            if dirty:
+                db.commit()
+
+        # 4. Generate our standard app JWT token
+        access_token = create_access_token(data={"sub": db_user.email})
+        
+        return {
+            "access_token": access_token, 
+            "token_type": "bearer",
+            "message": "Google Sign-In Successful"
+        }
+
+    except ValueError:
+        # Invalid token
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Invalid or expired Google ID token."
+        )
 
 # ==========================================
 # 4. UTILITIES

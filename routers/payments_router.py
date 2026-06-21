@@ -5,6 +5,8 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 from sqlalchemy.orm import Session
 from dodopayments import DodoPayments
 from standardwebhooks.webhooks import Webhook as StandardWebhook
@@ -59,6 +61,14 @@ API_PLAN_CONFIG = {
 ONE_TIME_PLANS = {
     # "Trial": {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 120},
     "Credit Pack": {"id": "pdt_0NYCtBgPqWWzyF6yKrE98", "credits": 900},
+}
+
+# Add this alongside your other PLAN_CONFIGs
+GOOGLE_PLAY_PLANS = {
+    "sub_basic_mo": 600,
+    "sub_pro_mo": 1500,
+    "sub_basic_yr": 7200,
+    "sub_pro_yr": 18000
 }
 
 class CheckoutRequest(BaseModel):
@@ -563,3 +573,102 @@ async def get_payment_history(
     except Exception as e:
         logger.error(f"Failed to fetch payment history: {e}")
         return []
+    
+class GooglePlayPurchaseReq(BaseModel):
+    product_id: str
+    purchase_token: str
+
+@router.post("/verify-purchase")
+async def verify_google_play_purchase(
+    request: GooglePlayPurchaseReq,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        # 1. Authenticate with Google Play API
+        credentials = service_account.Credentials.from_service_account_file('google-play-service-account.json')
+        service = build('androidpublisher', 'v3', credentials=credentials)
+        
+        product_id = request.product_id
+        is_subscription = product_id.startswith("sub_")
+
+        # -------------------------------------------------------------
+        # 2. CALL THE CORRECT GOOGLE API ENDPOINT
+        # -------------------------------------------------------------
+        if is_subscription:
+            result = service.purchases().subscriptions().get(  # pylint: disable=no-member
+                packageName="com.shin.depthflow",
+                subscriptionId=product_id,
+                token=request.purchase_token
+            ).execute()
+            
+            # Subscriptions use 'paymentState' (1 = Payment received, 2 = Free Trial)
+            is_valid_purchase = result.get('paymentState') in [1, 2] 
+            
+        else:
+            result = service.purchases().products().get(  # pylint: disable=no-member
+                packageName="com.shin.depthflow",
+                productId=product_id,
+                token=request.purchase_token
+            ).execute()
+            
+            # One-time products use 'purchaseState' (0 = Purchased)
+            is_valid_purchase = result.get('purchaseState') == 0
+
+        # -------------------------------------------------------------
+        # 3. PROCESS THE VERIFIED PURCHASE
+        # -------------------------------------------------------------
+        if is_valid_purchase:
+            
+            # Idempotency: Prevent double-crediting if the app sends the token twice
+            if hasattr(current_user, "last_payment_id") and current_user.last_payment_id == request.purchase_token:
+                return {"status": "ignored", "message": "Purchase already verified", "new_balance": current_user.credits}
+
+            if product_id not in GOOGLE_PLAY_PLANS:
+                raise HTTPException(status_code=400, detail="Unknown Google Play Product ID")
+
+            total_credits = GOOGLE_PLAY_PLANS[product_id]
+            
+            # --- APPLY CREDITS & SPLIT YEARLY LOGIC ---
+            if not is_subscription:
+                # It's a one-time pack: Just add to existing balance
+                current_user.credits += total_credits
+            else:
+                # It's a subscription: Reset the balance (use-it-or-lose-it)
+                is_yearly = product_id.endswith("_yr")
+                
+                if is_yearly:
+                    current_user.credits = total_credits // 12
+                    # Schedule the next drop for 30 days from now
+                    current_user.next_credit_drop_date = datetime.utcnow() + timedelta(days=30)
+                    current_user.billing_cycle = "yearly"
+                else:
+                    current_user.credits = total_credits
+                    # Clear drop date in case they downgraded from yearly to monthly
+                    current_user.next_credit_drop_date = None
+                    current_user.billing_cycle = "monthly"
+
+                # Keep the user's plan name in sync for the UI and Cron Job
+                if "basic" in product_id:
+                    current_user.plan = "Basic"
+                elif "pro" in product_id:
+                    current_user.plan = "Pro"
+                
+                current_user.subscription_status = "active"
+
+            # Save the token to prevent replay attacks
+            current_user.last_payment_id = request.purchase_token
+            db.commit()
+            
+            return {
+                "status": "success", 
+                "plan": current_user.plan,
+                "billing_cycle": current_user.billing_cycle,
+                "new_balance": current_user.credits
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Purchase not completed or was cancelled")
+            
+    except Exception as e:
+        logger.error(f"Google Play Verification Failed: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid purchase token or API error")

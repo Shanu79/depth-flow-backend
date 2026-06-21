@@ -83,8 +83,8 @@ def apply_watermark_local(input_path, output_path, watermark_path="assets/waterm
 @router.post("/generate-3d")
 async def generate_depthflow(
     file: UploadFile = File(...),
-    payload: str = Form(...), 
-    request_source: str = Form("api"),  
+    payload: str = Form(default='{"render": {"duration": 5}}'),
+    request_source: str = Form("api"),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)

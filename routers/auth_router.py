@@ -56,6 +56,14 @@ class ChangePasswordRequest(BaseModel):
     old_password: str
     new_password: str
 
+class ForgotPasswordReq(BaseModel):
+    email: EmailStr
+
+class ResetPasswordReq(BaseModel):
+    email: EmailStr
+    otp: str
+    new_password: str
+
 # ==========================================
 # HELPER: SEND OTP EMAIL VIA ZEPTOMAIL API
 # ==========================================
@@ -558,3 +566,58 @@ def change_password(
     db.commit()
     
     return {"status": "success", "message": "Password updated successfully."}
+
+# ==========================================
+# 7. FORGOT PASSWORD (Sends OTP)
+# ==========================================
+@router.post("/forgot-password")
+def forgot_password(request: ForgotPasswordReq, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == request.email).first()
+    
+    if not user:
+        # For security, we often return 200 even if email isn't found to prevent email enumeration,
+        # but here we'll follow your current pattern.
+        raise HTTPException(status_code=404, detail="Email not found.")
+
+    # Generate 6-digit OTP and set expiry
+    generated_otp = str(random.randint(100000, 999999))
+    user.otp = generated_otp
+    user.otp_expiry = datetime.now(timezone.utc) + timedelta(minutes=10)
+    db.commit()
+
+    # Send reset email
+    # You might want a separate template for "Reset Password", but reusing send_otp_email works
+    send_otp_email(user.email, generated_otp)
+
+    return {"message": "Password reset code sent to your email."}
+
+
+# ==========================================
+# 8. RESET PASSWORD (Verify OTP & Update)
+# ==========================================
+@router.post("/reset-password")
+def reset_password(request: ResetPasswordReq, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == request.email).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    
+    # 1. Verify OTP
+    if user.otp != request.otp:
+        raise HTTPException(status_code=400, detail="Invalid reset code.")
+    
+    # 2. Check Expiry
+    now = datetime.now(timezone.utc)
+    otp_expiry = user.otp_expiry.replace(tzinfo=timezone.utc) if user.otp_expiry.tzinfo is None else user.otp_expiry
+    if otp_expiry < now:
+        raise HTTPException(status_code=400, detail="Reset code has expired.")
+
+    # 3. Update Password
+    user.hashed_password = get_password_hash(request.new_password)
+    
+    # 4. Clear OTP fields
+    user.otp = None
+    user.otp_expiry = None
+    db.commit()
+
+    return {"message": "Your password has been reset successfully. Please log in."}

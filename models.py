@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from database import Base
-from datetime import datetime
+from datetime import datetime, timezone
 
 class User(Base):
     __tablename__ = "users"
@@ -48,8 +48,9 @@ class GenerationHistory(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     video_url = Column(String, nullable=False)
-    # We calculate expiry based on created_at + 30 mins
-    created_at = Column(DateTime, default=datetime.utcnow) 
+    
+    # FIXED: Use timezone-aware UTC default
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc)) 
     
     source = Column(String, default="workspace")
     # Relationship to user

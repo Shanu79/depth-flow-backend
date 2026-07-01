@@ -1,9 +1,14 @@
 import os
+import random
 import requests
 import random
 from datetime import datetime, timedelta, timezone
+from typing import Optional # Added
+from pathlib import Path
+from dotenv import load_dotenv
+import shutil
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status, File, UploadFile, Form
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from fastapi_sso.sso.google import GoogleSSO
@@ -21,7 +26,7 @@ from auth import (
     verify_password 
 )
 
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
@@ -41,8 +46,15 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 ZEPTOMAIL_SEND_TOKEN = os.getenv("ZEPTOMAIL_SEND_TOKEN")
 ZEPTOMAIL_FROM_ADDRESS = os.getenv("ZEPTOMAIL_FROM_ADDRESS","noreply@depthflow.io")
 ZEPTOMAIL_FROM_NAME = os.getenv("ZEPTOMAIL_FROM_NAME", "Depthflow AI")
+# NEW: Load the API key from .env securely
+ZEPTOMAIL_API_KEY = os.getenv("ZEPTOMAIL_API_KEY") 
 
 google_sso = GoogleSSO(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, CALLBACK_URL)
+
+# NEW: Missing Schema definition
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
 
 # ==========================================
 # HELPER: SEND OTP EMAIL VIA ZEPTOMAIL API
@@ -436,3 +448,113 @@ def regenerate_api_key(current_user: User = Depends(get_current_user), db: Sessi
     db.commit()
     
     return {"status": "success", "api_key": new_key, "message": "API key regenerated successfully"}
+
+# ==========================================
+# 5. UPDATE PROFILE (Multipart/Form-Data)
+# ==========================================
+# Allowed MIME types
+ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"]
+
+@router.post("/update-profile")
+async def update_profile(
+    full_name: Optional[str] = Form(None),
+    email: Optional[EmailStr] = Form(None),
+    profile_pic: Optional[UploadFile] = File(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Updates user's name, email, and/or profile picture.
+    Handles multipart form data to allow file uploads.
+    """
+    try:
+        dirty = False
+        
+        # 1. Update Full Name
+        if full_name is not None:
+            current_user.full_name = full_name
+            dirty = True
+            
+        # 2. Update Email (Check for conflicts)
+        if email is not None and email != current_user.email:
+            existing_user = db.query(User).filter(User.email == email).first()
+            if existing_user:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, 
+                    detail="This email address is already in use."
+                )
+            current_user.email = email
+            dirty = True
+            
+        # 3. Process Profile Picture Upload
+        if profile_pic:
+            # Create a unique filename using timestamp
+            ext = os.path.splitext(profile_pic.filename)[1]
+            filename = f"profile_{current_user.id}_{int(datetime.now().timestamp())}{ext}"
+            
+            # Directory where images are stored (Make sure your app serves this folder as static)
+            upload_dir = "static/uploads/profile_pics"
+            os.makedirs(upload_dir, exist_ok=True)
+            
+            file_path = os.path.join(upload_dir, filename)
+            
+            # Save the file locally
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(profile_pic.file, buffer)
+            
+            # Update the URL in the database
+            # Update this to match your actual domain/serving logic
+            current_user.profile_pic = f"https://api.depthflow.io/{file_path}"
+            dirty = True
+
+        if dirty:
+            db.commit()
+            db.refresh(current_user)
+
+        # Return updated user info (matches UserProfileResponse on Android)
+        return {
+            "id": current_user.id,
+            "email": current_user.email,
+            "full_name": current_user.full_name,
+            "credits": current_user.credits,
+            "profile_pic": current_user.profile_pic,
+            "plan": current_user.plan,
+            "subscription_status": current_user.subscription_status,
+            "billing_cycle": current_user.billing_cycle
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Use your actual logger here
+        print(f"Profile Update Error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="Failed to update profile info."
+        )
+
+
+# ==========================================
+# 6. CHANGE PASSWORD
+# ==========================================
+@router.post("/change-password")
+def change_password(
+    request: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Securely changes the user's password after verifying the old one.
+    """
+    # 1. Verify the old password matches
+    if not verify_password(request.old_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="The current password you entered is incorrect."
+        )
+    
+    # 2. Hash and update the new password
+    current_user.hashed_password = get_password_hash(request.new_password)
+    db.commit()
+    
+    return {"status": "success", "message": "Password updated successfully."}

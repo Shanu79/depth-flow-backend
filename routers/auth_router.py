@@ -361,12 +361,16 @@ def verify_google_token(token_data: GoogleTokenReq, db: Session = Depends(get_db
     Accepts a Google ID Token from an Android/iOS/Web client, verifies it, 
     and returns a standard JWT access token. Seamlessly merges accounts.
     """
+    # --- DEBUGGING LINES ---
+    print(f"DEBUG: Client ID in memory is: {os.environ.get('GOOGLE_CLIENT_ID')}")
+    print(f"DEBUG: Token received: {token_data.id_token[:20]}...") 
+    # -----------------------
+    
     try:
-        # 1. Verify the token with Google's servers
         idinfo = id_token.verify_oauth2_token(
             token_data.id_token, 
             google_requests.Request(), 
-            GOOGLE_CLIENT_ID
+            GOOGLE_CLIENT_ID # Make sure this variable is strictly defined
         )
 
         # 2. Extract verified user info

@@ -21,6 +21,10 @@ class User(Base):
     subscription_end_date = Column(DateTime, nullable=True)
     last_payment_id = Column(String, nullable=True)
     
+    # --- GOOGLE PLAY BILLING ---
+    # ADDED THIS: Used to link background webhook renewals to this user
+    play_purchase_token = Column(String, index=True, nullable=True) 
+    
     # --- API SUBSCRIPTION (NEW FIELDS) ---
     api_plan = Column(String, default="free") # "Free", "Api-Pro", etc.
     api_billing_cycle = Column(String, nullable=True) 

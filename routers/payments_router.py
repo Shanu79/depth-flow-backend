@@ -1,9 +1,11 @@
 import os
 import logging
+import base64
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
 from pydantic import BaseModel
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -70,6 +72,56 @@ GOOGLE_PLAY_PLANS = {
     "sub_basic_yr": 7200,
     "sub_pro_yr": 18000
 }
+
+async def process_renewal(purchase_token: str, db: Session):
+    try:
+        # 1. Find the user by the token (REQUIRES FIX #2 BELOW)
+        user = db.query(User).filter(User.play_purchase_token == purchase_token).first()
+        if not user:
+            logger.error(f"Renewal failed: No user found for token {purchase_token}")
+            return
+
+        # 2. Authenticate with Google Play API
+        credentials = service_account.Credentials.from_service_account_file('google-play-service-account.json')
+        service = build('androidpublisher', 'v3', credentials=credentials)
+
+        # We need to know the product_id (e.g., sub_pro_mo) to check the subscription
+        # Assuming you store this on the user, or infer it from user.plan
+        # If you don't store product_id, you can map it backwards from user.plan & user.billing_cycle
+        product_id = f"sub_{user.plan.lower()}_{'yr' if user.billing_cycle == 'yearly' else 'mo'}"
+
+        # 3. Call Google API to get the latest state
+        result = service.purchases().subscriptions().get( 
+            packageName="com.shin.depthflow",
+            subscriptionId=product_id,
+            token=purchase_token
+        ).execute()
+
+        # paymentState 1 = Payment received. 
+        if result.get('paymentState') == 1:
+            order_id = result.get('orderId')
+            
+            # Idempotency: Ensure we haven't already processed this exact renewal order
+            if user.last_payment_id == order_id:
+                logger.info(f"Renewal already processed for order: {order_id}")
+                return
+
+            # 4. Apply Credits
+            total_credits = GOOGLE_PLAY_PLANS.get(product_id, 0)
+            if user.billing_cycle == "yearly":
+                user.credits = total_credits // 12
+                user.next_credit_drop_date = datetime.utcnow() + timedelta(days=30)
+            else:
+                user.credits = total_credits
+
+            user.last_payment_id = order_id
+            db.commit()
+            logger.info(f"Successfully processed background renewal for {user.email}")
+        else:
+            logger.warning(f"Subscription renewal not in valid state: {result.get('paymentState')}")
+
+    except Exception as e:
+        logger.error(f"Failed to process background renewal: {e}")
 
 class CheckoutRequest(BaseModel):
     plan_name: str
@@ -620,8 +672,10 @@ async def verify_google_play_purchase(
         # -------------------------------------------------------------
         if is_valid_purchase:
             
-            # Idempotency: Prevent double-crediting if the app sends the token twice
-            if hasattr(current_user, "last_payment_id") and current_user.last_payment_id == request.purchase_token:
+            # Use orderId for idempotency, NOT the static purchase token
+            order_id = result.get('orderId', request.purchase_token)
+            
+            if hasattr(current_user, "last_payment_id") and current_user.last_payment_id == order_id:
                 return {"status": "ignored", "message": "Purchase already verified", "new_balance": current_user.credits}
 
             if product_id not in GOOGLE_PLAY_PLANS:
@@ -631,33 +685,31 @@ async def verify_google_play_purchase(
             
             # --- APPLY CREDITS & SPLIT YEARLY LOGIC ---
             if not is_subscription:
-                # It's a one-time pack: Just add to existing balance
                 current_user.credits += total_credits
             else:
-                # It's a subscription: Reset the balance (use-it-or-lose-it)
                 is_yearly = product_id.endswith("_yr")
                 
                 if is_yearly:
                     current_user.credits = total_credits // 12
-                    # Schedule the next drop for 30 days from now
                     current_user.next_credit_drop_date = datetime.utcnow() + timedelta(days=30)
                     current_user.billing_cycle = "yearly"
                 else:
                     current_user.credits = total_credits
-                    # Clear drop date in case they downgraded from yearly to monthly
                     current_user.next_credit_drop_date = None
                     current_user.billing_cycle = "monthly"
 
-                # Keep the user's plan name in sync for the UI and Cron Job
                 if "basic" in product_id:
                     current_user.plan = "Basic"
                 elif "pro" in product_id:
                     current_user.plan = "Pro"
                 
                 current_user.subscription_status = "active"
+                
+                # IMPORTANT: Save the token so the background webhook can find this user later
+                current_user.play_purchase_token = request.purchase_token
 
-            # Save the token to prevent replay attacks
-            current_user.last_payment_id = request.purchase_token
+            # Save the unique order_id to prevent double-crediting
+            current_user.last_payment_id = order_id
             db.commit()
             
             return {
@@ -672,3 +724,43 @@ async def verify_google_play_purchase(
     except Exception as e:
         logger.error(f"Google Play Verification Failed: {str(e)}")
         raise HTTPException(status_code=400, detail="Invalid purchase token or API error")
+    
+# --- GOOGLE PLAY RTDN WEBHOOK ---
+@router.post("/google-play-webhook")
+async def google_play_rtdn(
+    request: Request, 
+    background_tasks: BackgroundTasks, 
+    db: Session = Depends(get_db)
+):
+    try:
+        # 1. Get the Pub/Sub message
+        body = await request.json()
+        encoded_data = body.get("message", {}).get("data", "")
+        
+        if not encoded_data:
+            return {"status": "ignored", "reason": "No data"}
+
+        # 2. Decode the Base64 payload
+        decoded_data = base64.b64decode(encoded_data).decode('utf-8')
+        notification = json.loads(decoded_data)
+        
+        sub_notification = notification.get("subscriptionNotification")
+        if not sub_notification:
+            return {"status": "ignored", "reason": "Not a subscription event"}
+            
+        notification_type = sub_notification.get("notificationType")
+        purchase_token = sub_notification.get("purchaseToken")
+        
+        # Notification Type 2 = SUBSCRIPTION_RENEWED
+        # You might also want to handle Type 3 (CANCELED) to remove their plan
+        if notification_type == 2:
+            logger.info("Received Google Play renewal notification. Queueing task.")
+            # Offload to background so we reply to Google with 200 OK instantly
+            background_tasks.add_task(process_renewal, purchase_token, db)
+            
+        return {"status": "success"} 
+
+    except Exception as e:
+        logger.error(f"Google Play Webhook Error: {e}")
+        # Return 200 even on error, otherwise Google Pub/Sub will keep retrying forever
+        return {"status": "error", "detail": str(e)}

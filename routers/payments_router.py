@@ -637,15 +637,25 @@ async def verify_google_play_purchase(
     db: Session = Depends(get_db)
 ):
     try:
-        # 1. Authenticate with Google Play API securely via Environment Variables
-        google_creds_env = os.environ.get("GOOGLE_PLAY_CREDENTIALS")
-        
-        if google_creds_env:
-            # Load from DigitalOcean Environment Variable
-            creds_dict = json.loads(google_creds_env)
+        # 1. Reconstruct credentials from individual environment variables
+        # We check for GOOGLE_PRIVATE_KEY as our indicator that manual config is used
+        if os.environ.get("GOOGLE_PRIVATE_KEY"):
+            creds_dict = {
+                "type": "service_account",
+                "project_id": os.environ.get("GOOGLE_PROJECT_ID"),
+                "private_key_id": os.environ.get("GOOGLE_PRIVATE_KEY_ID"),
+                # This line is the most important part of your fix!
+                "private_key": os.environ.get("GOOGLE_PRIVATE_KEY").replace("\\n", "\n").replace('"', ''),
+                "client_email": os.environ.get("GOOGLE_CLIENT_EMAIL"),
+                "client_id": os.environ.get("GOOGLE_CLIENT_ID"),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "client_x509_cert_url": os.environ.get("GOOGLE_CLIENT_CERT_URL")
+            }
             credentials = service_account.Credentials.from_service_account_info(creds_dict)
         else:
-            # Fallback for local testing on your Windows machine
+            # Fallback for local testing (file-based)
             credentials = service_account.Credentials.from_service_account_file('google-play-service-account.json')
             
         service = build('androidpublisher', 'v3', credentials=credentials)

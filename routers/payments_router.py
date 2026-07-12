@@ -637,8 +637,17 @@ async def verify_google_play_purchase(
     db: Session = Depends(get_db)
 ):
     try:
-        # 1. Authenticate with Google Play API
-        credentials = service_account.Credentials.from_service_account_file('google-play-service-account.json')
+        # 1. Authenticate with Google Play API securely via Environment Variables
+        google_creds_env = os.environ.get("GOOGLE_PLAY_CREDENTIALS")
+        
+        if google_creds_env:
+            # Load from DigitalOcean Environment Variable
+            creds_dict = json.loads(google_creds_env)
+            credentials = service_account.Credentials.from_service_account_info(creds_dict)
+        else:
+            # Fallback for local testing on your Windows machine
+            credentials = service_account.Credentials.from_service_account_file('google-play-service-account.json')
+            
         service = build('androidpublisher', 'v3', credentials=credentials)
         
         product_id = request.product_id

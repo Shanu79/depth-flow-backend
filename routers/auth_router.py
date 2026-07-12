@@ -353,31 +353,26 @@ class GoogleTokenReq(BaseModel):
     id_token: str
 
 
+# Keep your list of allowed IDs
 ALLOWED_GOOGLE_CLIENT_IDS = [
     "145272653736-utjo56i95vp30pf5ekdgtti9g4n0bohd.apps.googleusercontent.com", # Web
     "145272653736-haotalbibj52rjgk9me35vd3n4hr128u.apps.googleusercontent.com"  # Android
 ]
 
-# ==========================================
-# 3b. GOOGLE ID TOKEN VERIFICATION (For Mobile / API)
-# ==========================================
 @router.post("/google/verify")
 def verify_google_token(token_data: GoogleTokenReq, db: Session = Depends(get_db)):
-    """
-    Accepts a Google ID Token from an Android/iOS/Web client, verifies it, 
-    and returns a standard JWT access token. Seamlessly merges accounts.
-    """
-    # --- DEBUGGING LINES ---
-    print(f"DEBUG: Client ID in memory is: {os.environ.get('GOOGLE_CLIENT_ID')}")
-    print(f"DEBUG: Token received: {token_data.id_token[:20]}...") 
-    # -----------------------
-    
     try:
+        # 1. Verify the token signature and expiration
+        # We do NOT pass the audience here because we want to check it manually against our list
         idinfo = id_token.verify_oauth2_token(
             token_data.id_token, 
-            google_requests.Request(), 
-            audience=ALLOWED_GOOGLE_CLIENT_IDS # Accepts either Web or Android token
+            google_requests.Request()
         )
+
+        # 2. MANUALLY verify the audience (the 'aud' claim)
+        # This prevents "confused deputy" attacks
+        if idinfo['aud'] not in ALLOWED_GOOGLE_CLIENT_IDS:
+            raise ValueError(f"Invalid audience: {idinfo['aud']}")
 
         # 2. Extract verified user info
         email = idinfo['email']
@@ -428,11 +423,12 @@ def verify_google_token(token_data: GoogleTokenReq, db: Session = Depends(get_db
             "message": "Google Sign-In Successful"
         }
 
-    except ValueError:
-        # Invalid token
+    except ValueError as e:
+        # This will tell you EXACTLY what Google disliked about the token
+        print(f"DEBUG: Token verification error: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, 
-            detail="Invalid or expired Google ID token."
+            detail=str(e)
         )
 
 # ==========================================

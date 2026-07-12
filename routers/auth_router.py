@@ -352,6 +352,12 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
 class GoogleTokenReq(BaseModel):
     id_token: str
 
+
+ALLOWED_GOOGLE_CLIENT_IDS = [
+    "145272653736-utjo56i95vp30pf5ekdgtti9g4n0bohd.apps.googleusercontent.com", # Web
+    "145272653736-haotalbibj52rjgk9me35vd3n4hr128u.apps.googleusercontent.com"  # Android
+]
+
 # ==========================================
 # 3b. GOOGLE ID TOKEN VERIFICATION (For Mobile / API)
 # ==========================================
@@ -370,7 +376,7 @@ def verify_google_token(token_data: GoogleTokenReq, db: Session = Depends(get_db
         idinfo = id_token.verify_oauth2_token(
             token_data.id_token, 
             google_requests.Request(), 
-            GOOGLE_CLIENT_ID # Make sure this variable is strictly defined
+            audience=ALLOWED_GOOGLE_CLIENT_IDS # Accepts either Web or Android token
         )
 
         # 2. Extract verified user info

@@ -181,7 +181,7 @@ async def create_checkout_session(
             if already_bought:
                 raise HTTPException(status_code=403, detail="You have already used the Trial pack in the past.")
 
-        if request.plan_name == "Credits Pack":
+        if request.plan_name == "Credit Pack":
             has_workspace = current_user.subscription_id and current_user.subscription_status == "active"
             has_api = current_user.api_subscription_id and current_user.api_subscription_status == "active"
             if not has_workspace and not has_api:
@@ -409,8 +409,17 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
 
                 # --- 4. SYNC STATE (SAVE NEW SUB ID) ---
                 if is_one_time:
-                    if not user.subscription_id or user.subscription_status != "active":
-                         user.plan = metadata.get("plan_name", user.plan)
+                    
+                    if metadata.get("plan_name") == "Trial":
+                        if not user.subscription_id or user.subscription_status != "active":
+                             user.plan = "Trial"
+                    
+                    # NEW: Upgrade "Free" users to "Credit Pack" so they bypass the watermark.
+                    # Pro and Basic users will be ignored by this block and keep their existing plans!
+                    elif metadata.get("plan_name") == "Credit Pack":
+                        if user.plan == "Free":
+                            user.plan = "Credit Pack"
+
                 else:
                     if is_api:
                         if new_sub_id:
@@ -708,12 +717,13 @@ async def verify_google_play_purchase(
             else:
                 is_yearly = product_id.endswith("_yr")
                 
+                # FIX: Make new subscription purchases additive so we don't wipe out Credit Packs!
                 if is_yearly:
-                    current_user.credits = total_credits // 12
+                    current_user.credits += (total_credits // 12)
                     current_user.next_credit_drop_date = datetime.utcnow() + timedelta(days=30)
                     current_user.billing_cycle = "yearly"
                 else:
-                    current_user.credits = total_credits
+                    current_user.credits += total_credits
                     current_user.next_credit_drop_date = None
                     current_user.billing_cycle = "monthly"
 

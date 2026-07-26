@@ -181,15 +181,6 @@ async def create_checkout_session(
             if already_bought:
                 raise HTTPException(status_code=403, detail="You have already used the Trial pack in the past.")
 
-        if request.plan_name == "Credit Pack":
-            has_workspace = current_user.subscription_id and current_user.subscription_status == "active"
-            has_api = current_user.api_subscription_id and current_user.api_subscription_status == "active"
-            if not has_workspace and not has_api:
-                raise HTTPException(
-                    status_code=403, 
-                    detail="You must have an active subscription to purchase add-on credit packs."
-                )
-
         credits_to_add = plan_data["credits"]
         is_one_time = True
 

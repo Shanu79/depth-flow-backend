@@ -7,9 +7,10 @@ import imageio_ffmpeg
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, GenerationHistory
+from models import User, GenerationHistory, HappyHourSession
 from datetime import datetime, timedelta
 from auth import get_current_user
+from happy_hour import begin_generation, confirm_generation, release_generation, remaining_videos
 import shutil
 import gc
 
@@ -144,7 +145,14 @@ async def generate_3d(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if current_user.credits < COST_PER_GENERATION:
+    # Happy Hour: active subscription + live server-side session + a free video slot => unlimited
+    # generation, no credits consumed. Otherwise (no session / expired / sub inactive / cap reached)
+    # fall through to the normal credit check. The slot is reserved now and confirmed or released below.
+    hh_grant = begin_generation(db, current_user)
+    unlimited = hh_grant is not None
+    hh_confirmed = False
+
+    if not unlimited and current_user.credits < COST_PER_GENERATION:
         raise HTTPException(status_code=402, detail="❌ Not enough credits.")
 
     try:
@@ -246,7 +254,7 @@ async def generate_3d(
 
         # --- 5. WATERMARK LOGIC ---
         is_free_plan = current_user.plan.lower() == "free"
-        is_ex_subscriber = current_user.subscription_status == "canceled"
+        is_ex_subscriber = (current_user.subscription_status or "").lower() in ("canceled", "cancelled")
         
         should_watermark = is_free_plan and not is_ex_subscriber
 
@@ -273,11 +281,18 @@ async def generate_3d(
 
         # 6. CLEANUP & RETURN
         background_tasks.add_task(cleanup_old_files)
-        current_user.credits -= COST_PER_GENERATION
-        db.commit() # This commits both the credit deduction AND the new history
+        if unlimited:
+            confirm_generation(db, hh_grant)  # slot reserved -> used, same commit as the history row
+        else:
+            current_user.credits -= COST_PER_GENERATION
+        db.commit() # This commits the credit deduction (if any) / happy hour slot AND the new history
+        hh_confirmed = True
 
+        hh_session = db.get(HappyHourSession, hh_grant.session_id) if unlimited else None
         return {
-            "status": "success", 
+            "status": "success",
+            "happy_hour_active": unlimited,
+            "happy_hour_remaining_videos": remaining_videos(hh_session),
             "video_url": final_url,
             "plan": current_user.plan,
             "remaining_credits": current_user.credits,
@@ -288,7 +303,11 @@ async def generate_3d(
     except Exception as e:
         print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+    finally:
+        # Failed generations never consume Happy Hour video allowance.
+        if hh_grant is not None and not hh_confirmed:
+            release_generation(db, hh_grant)
+
 
 # --- NEW ENDPOINT: GET HISTORY ---
 @router.get("/history")

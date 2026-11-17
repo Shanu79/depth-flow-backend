@@ -2,7 +2,7 @@ import os
 import logging
 import base64
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
@@ -16,6 +16,8 @@ from standardwebhooks.webhooks import Webhook as StandardWebhook
 from database import get_db
 from models import User
 from auth import get_current_user
+import happy_hour as hh
+import notifications as nt
 
 # --- SETUP ---
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +31,7 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 client = DodoPayments(
     bearer_token=DODO_API_KEY,
-    environment="live_mode" 
+    environment=os.getenv("DODO_ENVIRONMENT", "live_mode")  # set to "test_mode" for local dev
 )
 
 # SINGLE SOURCE OF TRUTH FOR CREDITS
@@ -72,6 +74,70 @@ GOOGLE_PLAY_PLANS = {
     "sub_basic_yr": 7200,
     "sub_pro_yr": 18000
 }
+
+# --- HAPPY HOUR HELPERS (token grants ride on the existing billing events) ---
+def _naive_utc(value) -> Optional[datetime]:
+    """Dodo/Google dates -> naive UTC datetime (the convention used across this backend)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _play_expiry(result: dict) -> Optional[datetime]:
+    try:
+        return datetime.utcfromtimestamp(int(result["expiryTimeMillis"]) / 1000)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _dodo_period_end(subscription_id: Optional[str]) -> Optional[datetime]:
+    """End of the current paid period (Dodo's next_billing_date); None if it can't be fetched."""
+    if not subscription_id:
+        return None
+    try:
+        sub = client.subscriptions.retrieve(subscription_id=subscription_id)
+        return _naive_utc(getattr(sub, "next_billing_date", None))
+    except Exception as e:
+        logger.warning(f"Could not fetch Dodo period end for {subscription_id}: {e}")
+        return None
+
+
+def _grant_happy_hour(db: Session, user: User, *, subscription_id, grant_ref, cycle, expiry, source):
+    """
+    Grant this billing period's Happy Hour tokens. Runs AFTER the main billing commit, in its own
+    transaction, so a Happy Hour problem can never roll back or block credits/plan changes. Idempotent on
+    `grant_ref` (payment/order id). If it ever fails, the entitlement is lazily bootstrapped on first use.
+    """
+    try:
+        cycle = (cycle or "").lower()
+        if cycle not in ("monthly", "yearly") or (user.plan or "").strip().lower() in hh._NON_SUBSCRIPTION_PLANS:
+            return
+        if expiry:
+            user.subscription_end_date = expiry
+        already_granted = bool(grant_ref) and (hh.get_entitlement(db, user.id) is not None
+                                               and hh.get_entitlement(db, user.id).last_grant_ref == grant_ref)
+        ent = hh.grant_entitlement(db, user, cycle, subscription_id, grant_ref, expiry=expiry, source=source)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Happy Hour grant failed for user {getattr(user, 'id', '?')}: {e}")
+        return
+
+    # Notify (inbox + Android push). Separate from the grant: it can never undo it, and the dedupe key
+    # makes a replayed webhook silent.
+    if ent is not None and not already_granted:
+        try:
+            nt.notify_token_granted(db, user.id, ent, grant_ref)
+        except Exception as e:
+            logger.warning(f"Happy Hour grant notification failed for user {user.id}: {e}")
+
 
 async def process_renewal(purchase_token: str, db: Session):
     try:
@@ -116,6 +182,10 @@ async def process_renewal(purchase_token: str, db: Session):
 
             user.last_payment_id = order_id
             db.commit()
+            # Happy Hour: renewal => new period's token allocation (monthly: reset to 1, yearly: 4)
+            _grant_happy_hour(db, user, subscription_id=purchase_token, grant_ref=order_id,
+                              cycle="yearly" if product_id.endswith("_yr") else "monthly",
+                              expiry=_play_expiry(result), source="google_play")
             logger.info(f"Successfully processed background renewal for {user.email}")
         else:
             logger.warning(f"Subscription renewal not in valid state: {result.get('paymentState')}")
@@ -431,6 +501,13 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
 
                 db.commit() # Important: Commit the NEW sub_id first
 
+                # --- HAPPY HOUR: new purchase / renewal of a WORKSPACE subscription grants this period's tokens.
+                # Plan changes arrive as a new subscription -> the entitlement is replaced, never stacked.
+                if not is_one_time and not is_api and new_sub_id:
+                    _grant_happy_hour(db, user, subscription_id=new_sub_id, grant_ref=payment_id,
+                                      cycle=user.billing_cycle, expiry=_dodo_period_end(new_sub_id),
+                                      source="dodo")
+
                 # --- 5. CLEANUP OLD SUBSCRIPTION ---
                 old_sub_id = metadata.get("old_sub_id")
                 if old_sub_id and old_sub_id != new_sub_id:
@@ -460,6 +537,8 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                 else:
                     user.subscription_status = status
                     config_map = PLAN_CONFIG
+                    if (status or "").lower() in ("cancelled", "canceled", "expired", "failed"):
+                        hh.invalidate_entitlement(db, user, hh.ENT_CANCELLED)  # unused tokens void, session ends
                 
                 # Keep Plan in Sync
                 found_plan = False
@@ -493,6 +572,7 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                     user.api_billing_cycle = None
                 elif user.subscription_id == sub_id:
                     user.subscription_status = "cancelled"
+                    hh.invalidate_entitlement(db, user, hh.ENT_CANCELLED)  # unused tokens void, session ends
                     user.plan = "Free"
                     user.subscription_id = None
                     user.billing_cycle = None
@@ -545,8 +625,9 @@ async def sync_subscription(
              user_db.subscription_id = None
              user_db.billing_cycle = None
              final_status = "cancelled"
+             hh.invalidate_entitlement(db, user_db, hh.ENT_CANCELLED)
 
-        if real_status == "active" and is_scheduled_cancel:
+        elif real_status == "active" and is_scheduled_cancel:
             next_date = getattr(dodo_sub, 'next_billing_date', None)
             fmt_date = str(next_date)[:10] if next_date else "soon"
             final_status = f"Scheduled for cancellation on {fmt_date}"
@@ -586,6 +667,7 @@ async def sync_subscription(
         print(f"SYNC ERROR: {e}")
         logger.error(f"Sync Failed: {e}")
         if "404" in str(e):
+             hh.invalidate_entitlement(db, user_db, hh.ENT_CANCELLED)
              user_db.subscription_status = "cancelled"
              user_db.subscription_id = None
              db.commit()
@@ -731,6 +813,13 @@ async def verify_google_play_purchase(
             # Save the unique order_id to prevent double-crediting
             current_user.last_payment_id = order_id
             db.commit()
+
+            # Happy Hour: a verified Play SUBSCRIPTION grants this period's tokens (own transaction, after
+            # the purchase is safely recorded). Idempotent on order_id.
+            if is_subscription:
+                _grant_happy_hour(db, current_user, subscription_id=request.purchase_token, grant_ref=order_id,
+                                  cycle=current_user.billing_cycle, expiry=_play_expiry(result),
+                                  source="google_play")
             
             return {
                 "status": "success", 
@@ -777,6 +866,13 @@ async def google_play_rtdn(
             logger.info("Received Google Play renewal notification. Queueing task.")
             # Offload to background so we reply to Google with 200 OK instantly
             background_tasks.add_task(process_renewal, purchase_token, db)
+        elif notification_type in (12, 13):
+            # 12 = SUBSCRIPTION_REVOKED, 13 = SUBSCRIPTION_EXPIRED -> access is over: void Happy Hour tokens.
+            # (3 = CANCELED keeps access until expiry, so the entitlement stays until its expiry date / type 13.)
+            play_user = db.query(User).filter(User.play_purchase_token == purchase_token).first()
+            if play_user:
+                hh.invalidate_entitlement(db, play_user, hh.ENT_CANCELLED)
+                db.commit()
             
         return {"status": "success"} 
 

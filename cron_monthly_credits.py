@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from database import SessionLocal
 from models import User
-from routers.payments_router import PLAN_CONFIG, API_PLAN_CONFIG
+import pricing
 
 def run_monthly_drops():
     db = SessionLocal()
@@ -26,11 +26,15 @@ def run_monthly_drops():
                 
             monthly_credits_to_add = 0
             
-            if is_platform_active and user.billing_cycle == "yearly" and user.plan in PLAN_CONFIG["yearly"]:
-                monthly_credits_to_add += PLAN_CONFIG["yearly"][user.plan]["credits"] // 12
-                
-            if is_api_active and user.api_billing_cycle == "yearly" and user.api_plan in API_PLAN_CONFIG["yearly"]:
-                monthly_credits_to_add += API_PLAN_CONFIG["yearly"][user.api_plan]["credits"] // 12
+            if is_platform_active and user.billing_cycle == "yearly":
+                yearly = pricing.yearly_credits(db, user.plan, api=False)
+                if yearly:
+                    monthly_credits_to_add += yearly // 12
+
+            if is_api_active and user.api_billing_cycle == "yearly":
+                yearly = pricing.yearly_credits(db, user.api_plan, api=True)
+                if yearly:
+                    monthly_credits_to_add += yearly // 12
                 
             if monthly_credits_to_add > 0:
                 user.credits = monthly_credits_to_add

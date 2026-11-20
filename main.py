@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from database import engine, Base, get_db  # Added get_db
 
 # --- IMPORT THE ROUTERS ---
-from routers import auth_router, depthflow_ai_router, payments_router, admin_router, ai_router, contact_router
+from routers import auth_router, depthflow_ai_router, payments_router, admin_router, ai_router, contact_router, popup_router, pricing_router
 
 # --- IMPORTS FOR THE ALIAS ROUTE ---
 # Adjust these imports if your folder structure differs slightly
@@ -62,6 +62,8 @@ app.include_router(ai_router.router)
 app.include_router(payments_router.router)
 app.include_router(admin_router.router)
 app.include_router(contact_router.router)
+app.include_router(popup_router.router)
+app.include_router(pricing_router.router)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

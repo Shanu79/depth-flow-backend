@@ -16,6 +16,7 @@ from standardwebhooks.webhooks import Webhook as StandardWebhook
 from database import get_db
 from models import User
 from auth import get_current_user
+import pricing
 
 # --- SETUP ---
 logging.basicConfig(level=logging.INFO)
@@ -32,38 +33,11 @@ client = DodoPayments(
     environment="live_mode" 
 )
 
-# SINGLE SOURCE OF TRUTH FOR CREDITS
-PLAN_CONFIG = {
-    "monthly": {
-        "Basic": {"id": "pdt_0NUQxXnGKlkhrpGBAFMvy", "credits": 600},
-        "Pro":   {"id": "pdt_0NUQxXJa0TR6vJJznsrt2", "credits": 1500},
-        "Premium":   {"id": "pdt_0Nc5Ts7erauRnehAFJV6Q", "credits": 4000},
-    },
-    "yearly": {
-        "Basic": {"id": "pdt_0NUQxWNFaRWTd8eoNkqoJ", "credits": 7200},
-        "Pro":   {"id": "pdt_0NUQxVyW088PIAwIzObuC", "credits": 18000},
-        "Premium": {"id": "pdt_0Nc5TfN5t1oLCfoeNN7AZ", "credits": 48000},
-    }
-}
-
-# --- NEW: API PLANS ---
-API_PLAN_CONFIG = {
-    "monthly": {
-        "Starter API": {"id": "pdt_0Nbt4jmPtgBIPmJgF3qdh", "credits": 10000},
-        "Growth API":  {"id": "pdt_0NbtLLrNFAwrGkvpH0lGQ", "credits": 30000},
-        "Pro API":     {"id": "pdt_0Nbt4bIY0qlHH3u8SMyyD", "credits": 65000},
-    },
-    "yearly": {
-        "Starter API": {"id": "dummy_api_starter_yearly", "credits": 120000},
-        "Growth API":  {"id": "dummy_api_growth_yearly", "credits": 324000},
-        "Pro API":     {"id": "dummy_api_pro_yearly", "credits": 720000},
-    }
-}
-
-ONE_TIME_PLANS = {
-    # "Trial": {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 120},
-    "Credit Pack": {"id": "pdt_0NYCtBgPqWWzyF6yKrE98", "credits": 900},
-}
+# Plan catalogue (product ids, credits, prices) now lives in the DB and is managed from the Admin Panel
+# (see pricing.py). These names are kept as the legacy fallback used until the plans are imported.
+PLAN_CONFIG = pricing.LEGACY_PLAN_CONFIG
+API_PLAN_CONFIG = pricing.LEGACY_API_PLAN_CONFIG
+ONE_TIME_PLANS = pricing.LEGACY_ONE_TIME_PLANS
 
 # Add this alongside your other PLAN_CONFIGs
 GOOGLE_PLAY_PLANS = {
@@ -165,37 +139,24 @@ async def create_checkout_session(
     # STEP 1: VALIDATE PLAN (One-Time vs Recurring)
     # ---------------------------------------------------------
     
-    # CASE A: ONE-TIME PAYMENT
-    if request.billing_cycle == "one_time":
-        plan_data = ONE_TIME_PLANS.get(request.plan_name)
-        if not plan_data:
-            raise HTTPException(status_code=400, detail="Invalid one-time plan")
-        
-        target_product_id = plan_data["id"]
+    # The plan, its Dodo product and its credits are ALWAYS resolved on the backend (never from the request).
+    try:
+        resolved = pricing.resolve_for_checkout(db, request.plan_name, request.billing_cycle)
+    except pricing.PlanUnavailable as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
 
-        if request.plan_name == "Trial":
-            if current_user.plan == "Trial":
-                raise HTTPException(status_code=403, detail="You already have the Trial pack.")
-            
-            already_bought = check_if_already_purchased(current_user.email, target_product_id)
-            if already_bought:
-                raise HTTPException(status_code=403, detail="You have already used the Trial pack in the past.")
+    target_product_id = resolved.product_id
+    credits_to_add = resolved.credits
+    is_one_time = resolved.is_one_time
+    is_api_plan = resolved.is_api
 
-        credits_to_add = plan_data["credits"]
-        is_one_time = True
+    if is_one_time and request.plan_name == "Trial":
+        if current_user.plan == "Trial":
+            raise HTTPException(status_code=403, detail="You already have the Trial pack.")
 
-    # CASE B: RECURRING SUBSCRIPTION
-    else:
-        if request.billing_cycle in PLAN_CONFIG and request.plan_name in PLAN_CONFIG[request.billing_cycle]:
-            plan_data = PLAN_CONFIG[request.billing_cycle][request.plan_name]
-        elif request.billing_cycle in API_PLAN_CONFIG and request.plan_name in API_PLAN_CONFIG[request.billing_cycle]:
-            plan_data = API_PLAN_CONFIG[request.billing_cycle][request.plan_name]
-            is_api_plan = True
-        else:
-            raise HTTPException(status_code=400, detail=f"Invalid plan: {request.plan_name}")
-
-        target_product_id = plan_data["id"]
-        credits_to_add = plan_data["credits"]
+        already_bought = check_if_already_purchased(current_user.email, target_product_id)
+        if already_bought:
+            raise HTTPException(status_code=403, detail="You have already used the Trial pack in the past.")
 
     # Grab the old sub ID so we can cancel it AFTER they pay for the new one
     if is_api_plan:
@@ -359,13 +320,16 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                     credits_to_add = int(metadata.get("credits_to_add"))
                     source = "Metadata (New/One-Time/Upgrade)"
                 elif is_renewal:
-                    config_map = API_PLAN_CONFIG if is_api else PLAN_CONFIG
                     active_cycle = user.api_billing_cycle if is_api else user.billing_cycle
                     active_plan = user.api_plan if is_api else user.plan
-                    
-                    current_cycle = config_map.get(active_cycle, {})
-                    current_plan = current_cycle.get(active_plan, {})
-                    credits_to_add = current_plan.get("credits", 0)
+                    # Prefer the exact product this payment is for, so price/credit changes on a newer product
+                    # never alter what an existing subscriber receives.
+                    paid_product_id = data.get("product_id")
+                    if not paid_product_id:
+                        cart = data.get("product_cart") or []
+                        if cart and isinstance(cart[0], dict):
+                            paid_product_id = cart[0].get("product_id")
+                    credits_to_add = pricing.renewal_credits(db, active_plan, active_cycle, is_api, paid_product_id)
                     source = f"Auto-Renewal ({active_plan})"
 
                 # --- 3. ADD / RESET CREDITS ---
@@ -456,25 +420,19 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                 is_api = user.api_subscription_id == sub_id
                 if is_api:
                     user.api_subscription_status = status
-                    config_map = API_PLAN_CONFIG
                 else:
                     user.subscription_status = status
-                    config_map = PLAN_CONFIG
-                
-                # Keep Plan in Sync
-                found_plan = False
-                for cycle, plans in config_map.items():
-                    for p_name, p_data in plans.items():
-                        if p_data["id"] == product_id:
-                            if is_api:
-                                user.api_plan = p_name
-                                user.api_billing_cycle = cycle
-                            else:
-                                user.plan = p_name
-                                user.billing_cycle = cycle
-                            found_plan = True
-                            break
-                    if found_plan: break
+
+                # Keep Plan in Sync (matches retired product versions too, so old subscribers still resolve)
+                found = pricing.resolve_by_product_id(db, product_id, is_api)
+                if found:
+                    p_name, cycle = found
+                    if is_api:
+                        user.api_plan = p_name
+                        user.api_billing_cycle = cycle
+                    else:
+                        user.plan = p_name
+                        user.billing_cycle = cycle
                 
                 db.commit()
 
@@ -556,20 +514,13 @@ async def sync_subscription(
         if user_db.subscription_status != final_status:
              user_db.subscription_status = final_status
 
-        found_plan = False
-        for cycle, plans in PLAN_CONFIG.items():
-            for p_name, p_data in plans.items():
-                config_id = str(p_data["id"]).strip()
-                remote_id = str(real_product_id).strip()
-                
-                if config_id == remote_id:
-                    if user_db.plan != p_name:
-                        print(f"UPDATING PLAN: {user_db.plan} -> {p_name}")
-                        user_db.plan = p_name
-                        user_db.billing_cycle = cycle
-                    found_plan = True
-                    break
-            if found_plan: break
+        found = pricing.resolve_by_product_id(db, real_product_id, False)
+        if found:
+            p_name, cycle = found
+            if user_db.plan != p_name:
+                print(f"UPDATING PLAN: {user_db.plan} -> {p_name}")
+                user_db.plan = p_name
+                user_db.billing_cycle = cycle
         
         db.add(user_db)
         db.commit()

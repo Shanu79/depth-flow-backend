@@ -97,6 +97,14 @@ def upgrade() -> None:
             sa.Column('button_text', sa.String(), nullable=True),
             sa.Column('button_link', sa.String(), nullable=True),
             sa.Column('coupon_code', sa.String(), nullable=True),
+            sa.Column('button_color', sa.String(), nullable=True),
+            sa.Column('text_color', sa.String(), nullable=True),
+            sa.Column('bg_color', sa.String(), nullable=True),
+            sa.Column('accent_color', sa.String(), nullable=True),
+            sa.Column('header_text', sa.String(), nullable=True),
+            sa.Column('footnote', sa.String(), nullable=True),
+            sa.Column('layout', sa.String(), nullable=False, server_default='split'),
+            sa.Column('show_countdown', sa.Boolean(), nullable=False, server_default=sa.false()),
             sa.Column('target_audience', sa.String(), nullable=False, server_default='ALL'),
             sa.Column('start_at', sa.DateTime(), nullable=True),
             sa.Column('end_at', sa.DateTime(), nullable=True),
@@ -107,6 +115,32 @@ def upgrade() -> None:
             sa.Column('updated_at', sa.DateTime(), server_default=sa.func.current_timestamp()),
         )
         op.create_index('ix_popups_id', 'popups', ['id'])
+    have = {c['name'] for c in Inspector.from_engine(conn).get_columns('popups')}
+    for name, col in (
+        ('button_color', sa.Column('button_color', sa.String(), nullable=True)),
+        ('text_color', sa.Column('text_color', sa.String(), nullable=True)),
+        ('bg_color', sa.Column('bg_color', sa.String(), nullable=True)),
+        ('accent_color', sa.Column('accent_color', sa.String(), nullable=True)),
+        ('header_text', sa.Column('header_text', sa.String(), nullable=True)),
+        ('footnote', sa.Column('footnote', sa.String(), nullable=True)),
+        ('layout', sa.Column('layout', sa.String(), nullable=False, server_default='split')),
+        ('show_countdown', sa.Column('show_countdown', sa.Boolean(), nullable=False, server_default=sa.false())),
+    ):
+        if name not in have:
+            op.add_column('popups', col)
+    if 'offer_banners' in tables:
+        have_b = {c['name'] for c in Inspector.from_engine(conn).get_columns('offer_banners')}
+        for name, col in (
+            ('button_color', sa.Column('button_color', sa.String(), nullable=True)),
+            ('text_color', sa.Column('text_color', sa.String(), nullable=True)),
+            ('bg_color', sa.Column('bg_color', sa.String(), nullable=True)),
+            ('accent_color', sa.Column('accent_color', sa.String(), nullable=True)),
+            ('header_text', sa.Column('header_text', sa.String(), nullable=True)),
+            ('badge_text', sa.Column('badge_text', sa.String(), nullable=True)),
+            ('show_countdown', sa.Column('show_countdown', sa.Boolean(), nullable=False, server_default=sa.false())),
+        ):
+            if name not in have_b:
+                op.add_column('offer_banners', col)
     if 'ix_popups_status_window' not in _indexes(Inspector.from_engine(conn), 'popups'):
         op.create_index('ix_popups_status_window', 'popups', ['status', 'start_at', 'end_at'])
 
@@ -134,6 +168,13 @@ def upgrade() -> None:
             sa.Column('button_text', sa.String(), nullable=True),
             sa.Column('button_link', sa.String(), nullable=True),
             sa.Column('coupon_code', sa.String(), nullable=True),
+            sa.Column('button_color', sa.String(), nullable=True),
+            sa.Column('text_color', sa.String(), nullable=True),
+            sa.Column('bg_color', sa.String(), nullable=True),
+            sa.Column('accent_color', sa.String(), nullable=True),
+            sa.Column('header_text', sa.String(), nullable=True),
+            sa.Column('badge_text', sa.String(), nullable=True),
+            sa.Column('show_countdown', sa.Boolean(), nullable=False, server_default=sa.false()),
             sa.Column('start_at', sa.DateTime(), nullable=True),
             sa.Column('end_at', sa.DateTime(), nullable=True),
             sa.Column('is_active', sa.Boolean(), nullable=False, server_default=sa.false()),
@@ -143,10 +184,65 @@ def upgrade() -> None:
         )
         op.create_index('ix_offer_banners_id', 'offer_banners', ['id'])
 
+    # festive styling columns (both tables), added whether the tables were just created or already existed
+    for table in ('popups', 'offer_banners'):
+        if table in Inspector.from_engine(conn).get_table_names():
+            have_s = {c['name'] for c in Inspector.from_engine(conn).get_columns(table)}
+            for name, col in (
+                ('bg_color2', sa.Column('bg_color2', sa.String(), nullable=True)),
+                ('theme', sa.Column('theme', sa.String(), nullable=False, server_default='none')),
+                ('emoji', sa.Column('emoji', sa.String(), nullable=True)),
+                ('font_style', sa.Column('font_style', sa.String(), nullable=False, server_default='modern')),
+                ('bg_image_url', sa.Column('bg_image_url', sa.String(), nullable=True)),
+                ('display_mode', sa.Column('display_mode', sa.String(), nullable=False, server_default='designed')),
+            ):
+                if name not in have_s:
+                    op.add_column(table, col)
+            if table == 'offer_banners' and 'mobile_image_url' not in have_s:
+                op.add_column(table, sa.Column('mobile_image_url', sa.String(), nullable=True))
+
+    if 'promo_templates' not in Inspector.from_engine(conn).get_table_names():
+        op.create_table(
+            'promo_templates',
+            sa.Column('id', sa.Integer(), primary_key=True),
+            sa.Column('kind', sa.String(), nullable=False),
+            sa.Column('name', sa.String(), nullable=False),
+            sa.Column('emoji', sa.String(), nullable=True),
+            sa.Column('data', sa.Text(), nullable=False),
+            sa.Column('end_in_days', sa.Integer(), nullable=True),
+            sa.Column('created_by_user_id', sa.Integer(), nullable=True),
+            sa.Column('created_at', sa.DateTime(), server_default=sa.func.current_timestamp()),
+        )
+        op.create_index('ix_promo_templates_id', 'promo_templates', ['id'])
+        op.create_index('ix_promo_templates_kind', 'promo_templates', ['kind'])
+
+    if 'whats_new_releases' not in Inspector.from_engine(conn).get_table_names():
+        op.create_table(
+            'whats_new_releases',
+            sa.Column('id', sa.Integer(), primary_key=True),
+            sa.Column('tab_label', sa.String(), nullable=False),
+            sa.Column('badge_text', sa.String(), nullable=True),
+            sa.Column('title', sa.String(), nullable=False),
+            sa.Column('subtitle', sa.Text(), nullable=True),
+            sa.Column('features', sa.Text(), nullable=False, server_default='[]'),
+            sa.Column('button1_text', sa.String(), nullable=True),
+            sa.Column('button1_link', sa.String(), nullable=True),
+            sa.Column('button1_style', sa.String(), nullable=False, server_default='light'),
+            sa.Column('button2_text', sa.String(), nullable=True),
+            sa.Column('button2_link', sa.String(), nullable=True),
+            sa.Column('auto_show', sa.Boolean(), nullable=False, server_default=sa.false()),
+            sa.Column('status', sa.String(), nullable=False, server_default='INACTIVE'),
+            sa.Column('display_order', sa.Integer(), nullable=False, server_default='0'),
+            sa.Column('created_by_user_id', sa.Integer(), nullable=True),
+            sa.Column('created_at', sa.DateTime(), server_default=sa.func.current_timestamp()),
+            sa.Column('updated_at', sa.DateTime(), server_default=sa.func.current_timestamp()),
+        )
+        op.create_index('ix_whats_new_releases_id', 'whats_new_releases', ['id'])
+
 
 def downgrade() -> None:
     conn = op.get_bind()
     tables = Inspector.from_engine(conn).get_table_names()
-    for t in ('offer_banners', 'popup_displays', 'popups', 'plan_prices', 'pricing_plans'):
+    for t in ('whats_new_releases', 'promo_templates', 'offer_banners', 'popup_displays', 'popups', 'plan_prices', 'pricing_plans'):
         if t in tables:
             op.drop_table(t)

@@ -28,9 +28,15 @@ DODO_API_KEY = os.environ.get("DODO_PAYMENTS_API_KEY")
 WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
+# "live_mode" (default, so production is unchanged unless you opt in) or "test_mode" for rehearsals / staging.
+DODO_ENVIRONMENT = os.environ.get("DODO_ENVIRONMENT", "live_mode").strip()
+if DODO_ENVIRONMENT not in ("live_mode", "test_mode"):
+    raise RuntimeError(f"DODO_ENVIRONMENT must be 'live_mode' or 'test_mode', got {DODO_ENVIRONMENT!r}")
+logger.info("Dodo Payments environment: %s", DODO_ENVIRONMENT)
+
 client = DodoPayments(
     bearer_token=DODO_API_KEY,
-    environment="live_mode" 
+    environment=DODO_ENVIRONMENT,
 )
 
 # Plan catalogue (product ids, credits, prices) now lives in the DB and is managed from the Admin Panel

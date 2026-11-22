@@ -333,6 +333,36 @@ def test_09_popup_and_banner_input_is_sanitised_and_validated():
         assert c.post("/admin/popups", json=popup_body(image_url="javascript:alert(1)")).status_code == 422
         assert c.post("/admin/popups", json=popup_body(target_audience="EVERYONE")).status_code == 422
         assert c.post("/admin/popups", json=popup_body(title="   ")).status_code == 422
+        r = c.post("/admin/popups", json=popup_body(button_color="#C9A93B"))
+        assert r.status_code == 201 and r.json()["button_color"] == "#c9a93b", r.text          # normalised
+        assert c.post("/admin/popups", json=popup_body()).json()["button_color"] is None       # optional
+        for bad_color in ("red", "#fff", "#12345g", "javascript:1", "#ff0000;x"):
+            assert c.post("/admin/popups", json=popup_body(button_color=bad_color)).status_code == 422, bad_color
+        for field in ("text_color", "bg_color", "accent_color"):
+            assert c.post("/admin/popups", json=popup_body(**{field: "url(x)"})).status_code == 422, field
+        r = c.post("/admin/popups", json=popup_body(
+            layout="stack", header_text="<b>WAIT!</b> Offer", footnote="*terms", bg_color="#0B1C33",
+            text_color="#ffffff", accent_color="#FACC15", show_countdown=True, end_at="2099-01-01T00:00:00Z"))
+        j = r.json()
+        assert r.status_code == 201, r.text
+        assert (j["layout"], j["header_text"], j["footnote"], j["bg_color"], j["accent_color"], j["show_countdown"]) ==             ("stack", "WAIT! Offer", "*terms", "#0b1c33", "#facc15", True), j
+        r = c.post("/admin/popups", json=popup_body(theme="snow", emoji="<b>🎅</b>", font_style="elegant",
+                                                    bg_color="#7F1D1D", bg_color2="#14532D"))
+        j = r.json()
+        assert r.status_code == 201, r.text
+        assert (j["theme"], j["emoji"], j["font_style"], j["bg_color2"]) == ("snow", "🎅", "elegant", "#14532d"), j
+        d0 = c.post("/admin/popups", json=popup_body()).json()
+        assert (d0["theme"], d0["font_style"], d0["emoji"], d0["bg_color2"]) == ("none", "modern", None, None)
+        assert c.post("/admin/popups", json=popup_body(theme="fire")).status_code == 422
+        assert c.post("/admin/popups", json=popup_body(font_style="comic")).status_code == 422
+        assert c.post("/admin/popups", json=popup_body(bg_color2="blue")).status_code == 422
+        assert c.post("/admin/popups", json=popup_body(emoji="x" * 9)).status_code == 422
+        rb = c.post("/admin/offer-banner", json={"title": "X", "theme": "lights", "emoji": "🎄", "bg_color2": "#14532d"})
+        assert rb.status_code == 201 and rb.json()["theme"] == "lights" and rb.json()["bg_color2"] == "#14532d", rb.text
+        assert c.post("/admin/popups", json=popup_body(show_countdown=True)).status_code == 422   # countdown needs an end date
+        assert c.post("/admin/popups", json=popup_body(layout="weird")).status_code == 422
+        d = c.post("/admin/popups", json=popup_body()).json()
+        assert d["layout"] == "split" and d["show_countdown"] is False and d["bg_color"] is None
         assert c.post("/admin/popups", json=popup_body(start_at="2026-06-02T10:00:00Z",
                                                        end_at="2026-06-01T10:00:00Z")).status_code == 422
         r = c.post("/admin/popups", json=popup_body(start_at="2026-06-02T10:00:00+02:00"))
@@ -402,6 +432,16 @@ def test_12_http_banner_admin_and_public_endpoint():
                                                 "button_link": "/pricing", "coupon_code": "bf30", "is_active": True})
         assert r.status_code == 201 and r.json()["state"] == "LIVE", r.text
         bid = r.json()["id"]
+        # style fields on the banner
+        r2 = c.post("/admin/offer-banner", json={"title": "BF", "badge_text": "<i>50% OFF</i>", "header_text": "END OF SEASON",
+                                                  "bg_color": "#120D2B", "accent_color": "#facc15", "show_countdown": True,
+                                                  "end_at": "2099-01-01T00:00:00Z"})
+        assert r2.status_code == 201, r2.text
+        j = r2.json()
+        assert (j["badge_text"], j["header_text"], j["bg_color"], j["show_countdown"]) == ("50% OFF", "END OF SEASON", "#120d2b", True), j
+        assert c.post("/admin/offer-banner", json={"title": "x", "show_countdown": True}).status_code == 422   # needs end date
+        assert c.post("/admin/offer-banner", json={"title": "x", "bg_color": "red"}).status_code == 422
+        c.delete(f"/admin/offer-banner/{j['id']}")
         st["email"] = None                                                    # public endpoint needs no login
         b = c.get("/offer-banner/active").json()["banner"]
         assert b["title"] == "Black Friday" and b["coupon_code"] == "BF30"
@@ -808,6 +848,161 @@ def test_26_dodo_gateway_adapter_clones_template_dedupes_by_metadata_and_verifie
         pass
     assert len(prods.created) == 1
     assert gw.read_product("pdt_tmpl") == {"price_minor": 2000, "currency": "USD"}
+
+
+def test_27_saved_templates_and_background_image():
+    c, S, st, gw, done = http_env()
+    try:
+        d = S(); make_user(d, "user@x.com"); d.close()
+        st["email"] = "user@x.com"
+        assert c.get("/admin/promo-templates").status_code == 403
+        assert c.post("/admin/promo-templates", json={"kind": "popup", "name": "x", "data": {}}).status_code == 403
+        with_admin(S, st)
+        # background image goes through the same https / in-app-path validation
+        r = c.post("/admin/popups", json=popup_body(bg_image_url="https://cdn.example.com/bg.jpg"))
+        assert r.status_code == 201 and r.json()["bg_image_url"] == "https://cdn.example.com/bg.jpg", r.text
+        assert c.post("/admin/popups", json=popup_body(bg_image_url="javascript:alert(1)")).status_code == 422
+        assert c.post("/admin/offer-banner", json={"title": "x", "bg_image_url": "https://cdn.example.com/b.jpg"}).status_code == 201
+
+        data = {"title": "<b>Diwali</b> Sale", "theme": "sparkles", "emoji": "🪔", "bg_color": "#7C2D12",
+                "bg_color2": "#581c87", "show_countdown": True, "bg_image_url": "https://cdn.example.com/d.jpg",
+                "layout": "stack", "evil_extra_field": "dropped", "start_at": "2020-01-01T00:00:00Z"}
+        r = c.post("/admin/promo-templates", json={"kind": "popup", "name": " My <i>Diwali</i> ", "emoji": "🪔",
+                                                    "data": data, "end_in_days": 5})
+        assert r.status_code == 201, r.text
+        t = r.json()
+        assert t["name"] == "My Diwali" and t["end_in_days"] == 5
+        assert t["data"]["title"] == "Diwali Sale" and t["data"]["bg_color"] == "#7c2d12"          # sanitised + normalised
+        assert "evil_extra_field" not in t["data"] and "start_at" not in t["data"]                 # whitelist only
+        assert t["data"]["show_countdown"] is True and t["data"]["bg_image_url"].endswith("d.jpg")
+        # invalid content is rejected exactly like a real popup would be
+        for bad in ({"bg_color": "red"}, {"button_link": "javascript:1"}, {"theme": "fire"}, {"bg_image_url": "data:x"}):
+            assert c.post("/admin/promo-templates", json={"kind": "popup", "name": "bad", "data": {"title": "t", **bad}}).status_code == 422, bad
+        assert c.post("/admin/promo-templates", json={"kind": "other", "name": "x", "data": {}}).status_code == 422
+        assert c.post("/admin/promo-templates", json={"kind": "popup", "name": "  ", "data": {}}).status_code == 422
+        # banner template keeps banner-only fields
+        rb = c.post("/admin/promo-templates", json={"kind": "banner", "name": "BF", "data": {"title": "BF", "badge_text": "50% OFF", "layout": "stack"}})
+        assert rb.status_code == 201 and rb.json()["data"].get("badge_text") == "50% OFF" and "layout" not in rb.json()["data"]
+        assert [x["name"] for x in c.get("/admin/promo-templates?kind=popup").json()["templates"]] == ["My Diwali"]
+        assert len(c.get("/admin/promo-templates").json()["templates"]) == 2
+        assert c.delete(f"/admin/promo-templates/{t['id']}").status_code == 200
+        assert c.delete(f"/admin/promo-templates/{t['id']}").status_code == 404
+        assert len(c.get("/admin/promo-templates").json()["templates"]) == 1
+    finally:
+        done()
+
+
+def test_28_image_only_popup_and_banner():
+    c, S, st, gw, done = http_env()
+    try:
+        with_admin(S, st)
+        IMG = "https://cdn.example.com/full.jpg"
+        # popup: a finished creative needs only an image (+ optional link, no button text)
+        r = c.post("/admin/popups", json={"title": "Eid creative", "display_mode": "image", "image_url": IMG,
+                                          "button_link": "/pricing", "status": "ACTIVE"})
+        assert r.status_code == 201, r.text
+        j = r.json()
+        assert j["display_mode"] == "image" and j["image_url"] == IMG and j["button_link"] == "/pricing", j
+        assert c.post("/admin/popups", json={"title": "x", "display_mode": "image"}).status_code == 422     # image required
+        assert c.post("/admin/popups", json={"title": "x", "display_mode": "poster", "image_url": IMG}).status_code == 422
+        # designed mode still needs button text for a link
+        assert c.post("/admin/popups", json={"title": "x", "button_link": "/pricing"}).status_code == 422
+        # a stale countdown flag is ignored in image mode (no end date needed)
+        r = c.post("/admin/popups", json={"title": "x", "display_mode": "image", "image_url": IMG, "show_countdown": True})
+        assert r.status_code == 201 and r.json()["show_countdown"] is False, r.text
+        assert c.post("/admin/popups", json={"title": "x", "display_mode": "image", "image_url": "javascript:1"}).status_code == 422
+        # default is designed
+        assert c.post("/admin/popups", json=popup_body()).json()["display_mode"] == "designed"
+
+        # banner: desktop + optional phone image, served by the public endpoint
+        rb = c.post("/admin/offer-banner", json={"title": "Sale creative", "display_mode": "image", "image_url": IMG,
+                                                 "mobile_image_url": "https://cdn.example.com/m.jpg",
+                                                 "button_link": "/pricing", "is_active": True})
+        assert rb.status_code == 201, rb.text
+        st["email"] = None
+        pub = c.get("/offer-banner/active").json()["banner"]
+        assert pub["display_mode"] == "image" and pub["mobile_image_url"].endswith("m.jpg") and pub["image_url"] == IMG
+        st["email"] = "admin@x.com"
+        assert c.post("/admin/offer-banner", json={"title": "x", "display_mode": "image"}).status_code == 422
+        assert c.post("/admin/offer-banner", json={"title": "x", "display_mode": "image", "image_url": IMG,
+                                                   "mobile_image_url": "data:image/png;base64,AAAA"}).status_code == 422
+        # templates can carry image mode too
+        rt = c.post("/admin/promo-templates", json={"kind": "banner", "name": "Creative", "data": {
+            "title": "t", "display_mode": "image", "image_url": IMG, "mobile_image_url": "https://cdn.example.com/m.jpg"}})
+        assert rt.status_code == 201 and rt.json()["data"]["display_mode"] == "image", rt.text
+    finally:
+        done()
+
+
+def _wn_body(**kw):
+    b = {"tab_label": "Spring update", "badge_text": "New", "title": "Spring is here", "subtitle": "Lots of new things.",
+         "features": [{"icon": "rocket", "title": "Faster", "description": "Much faster."}],
+         "button1_text": "Go", "button1_link": "/pricing", "button1_style": "dark",
+         "button2_text": "Later", "auto_show": False, "status": "ACTIVE"}
+    b.update(kw)
+    return b
+
+
+def test_29_whats_new_releases_admin_and_public():
+    c, S, st, gw, done = http_env()
+    try:
+        d = S(); make_user(d, "user@x.com"); d.close()
+        st["email"] = "user@x.com"
+        assert c.get("/admin/whats-new").status_code == 403
+        assert c.post("/admin/whats-new", json=_wn_body()).status_code == 403
+        assert c.post("/admin/whats-new/import-defaults").status_code == 403
+        st["email"] = None                                              # the public endpoint needs no login
+        assert c.get("/whats-new").json() == {"releases": [], "announce_version": None}
+
+        with_admin(S, st)
+        # one-time import of the built-in content; never duplicates
+        r = c.post("/admin/whats-new/import-defaults")
+        assert r.status_code == 201 and r.json()["imported"] == 2, r.text
+        assert c.post("/admin/whats-new/import-defaults").status_code == 409
+        pub = c.get("/whats-new").json()
+        assert [x["tab_label"] for x in pub["releases"]] == ["Latest: App Launch", "Version 2.0 Updates"]
+        assert pub["announce_version"] is None                          # imported content is not auto-announced
+        assert pub["releases"][0]["button1_style"] == "google_play" and len(pub["releases"][1]["features"]) == 7
+        assert "status" not in pub["releases"][0] and "auto_show" not in pub["releases"][0]
+
+        # create: sanitised, normalised, newest first on ties
+        r = c.post("/admin/whats-new", json=_wn_body(title="<b>Spring</b> is here", auto_show=True,
+                                                     features=[{"icon": "rocket", "title": "<i>Fast</i>", "description": "x"}]))
+        assert r.status_code == 201, r.text
+        j = r.json()
+        assert j["title"] == "Spring is here" and j["features"][0]["title"] == "Fast" and j["auto_show"] is True
+        pub = c.get("/whats-new").json()
+        assert pub["releases"][0]["id"] == j["id"]                      # display_order 0 ties -> newest first
+        assert pub["announce_version"] == j["id"]
+        # editing does NOT re-announce; archiving removes it from the modal and the announcement
+        assert c.put(f"/admin/whats-new/{j['id']}", json=_wn_body(title="Spring edited", auto_show=True)).status_code == 200
+        assert c.get("/whats-new").json()["announce_version"] == j["id"]
+        assert c.patch(f"/admin/whats-new/{j['id']}/status", json={"status": "INACTIVE"}).status_code == 200
+        pub = c.get("/whats-new").json()
+        assert len(pub["releases"]) == 2 and pub["announce_version"] is None
+        assert c.delete(f"/admin/whats-new/{j['id']}").json()["status"] == "archived"
+        assert c.put(f"/admin/whats-new/{j['id']}", json=_wn_body()).status_code == 409
+        assert len(c.get("/admin/whats-new").json()["releases"]) == 2
+        assert len(c.get("/admin/whats-new?include_archived=true").json()["releases"]) == 3
+
+        # reorder
+        ids = [x["id"] for x in c.get("/admin/whats-new").json()["releases"]]
+        assert c.post("/admin/whats-new/reorder", json={"items": [{"id": ids[0], "display_order": 5}, {"id": ids[1], "display_order": 1}]}).status_code == 200
+        assert [x["id"] for x in c.get("/whats-new").json()["releases"]] == [ids[1], ids[0]]
+        assert c.post("/admin/whats-new/reorder", json={"items": [{"id": 9999, "display_order": 1}]}).status_code == 404
+
+        # validation
+        bad = [{"features": [{"icon": "explosion", "title": "x"}]}, {"features": [{"icon": "zap", "title": "  "}]},
+               {"features": [{"icon": "zap", "title": "x"}] * 13}, {"button1_link": "javascript:alert(1)"},
+               {"button2_link": "/x", "button2_text": None}, {"button1_style": "neon"},
+               {"button1_style": "google_play", "button1_link": None}, {"tab_label": "  "}, {"title": ""},
+               {"tab_label": "x" * 31}, {"status": "ARCHIVED"}]
+        for patch in bad:
+            assert c.post("/admin/whats-new", json=_wn_body(**patch)).status_code == 422, patch
+        ok = c.post("/admin/whats-new", json=_wn_body(button1_link="https://play.google.com/store/apps/details?id=x", button1_style="google_play"))
+        assert ok.status_code == 201, ok.text
+    finally:
+        done()
 
 
 # ----------------------------------------------------------------------------------------------------------

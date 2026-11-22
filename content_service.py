@@ -66,7 +66,13 @@ def popup_state(p: Popup, now: datetime) -> str:
 def serialize_popup_public(p: Popup) -> dict:
     return {"id": p.id, "title": p.title, "description": p.description or "", "image_url": p.image_url,
             "button_text": p.button_text, "button_link": p.button_link, "coupon_code": p.coupon_code,
-            "priority": p.priority}
+            "button_color": p.button_color, "text_color": p.text_color, "bg_color": p.bg_color,
+            "accent_color": p.accent_color, "header_text": p.header_text, "footnote": p.footnote,
+            "layout": p.layout or "split",
+            "bg_color2": p.bg_color2, "theme": p.theme or "none", "emoji": p.emoji,
+            "font_style": p.font_style or "modern", "bg_image_url": p.bg_image_url,
+            "display_mode": p.display_mode or "designed", "show_countdown": bool(p.show_countdown),
+            "end_at": _iso(p.end_at), "priority": p.priority}
 
 
 def serialize_popup_admin(db: Session, p: Popup, now: Optional[datetime] = None) -> dict:
@@ -146,7 +152,12 @@ def active_banner(db: Session, now: Optional[datetime] = None) -> Optional[Offer
 def serialize_banner_public(b: OfferBanner) -> dict:
     return {"id": b.id, "title": b.title, "description": b.description or "", "image_url": b.image_url,
             "button_text": b.button_text, "button_link": b.button_link, "coupon_code": b.coupon_code,
-            "end_at": _iso(b.end_at)}
+            "button_color": b.button_color, "text_color": b.text_color, "bg_color": b.bg_color,
+            "accent_color": b.accent_color, "header_text": b.header_text, "badge_text": b.badge_text,
+            "show_countdown": bool(b.show_countdown),
+            "bg_color2": b.bg_color2, "theme": b.theme or "none", "emoji": b.emoji,
+            "font_style": b.font_style or "modern", "bg_image_url": b.bg_image_url,
+            "display_mode": b.display_mode or "designed", "mobile_image_url": b.mobile_image_url, "end_at": _iso(b.end_at)}
 
 
 def serialize_banner_admin(b: OfferBanner, now: Optional[datetime] = None) -> dict:

@@ -12,7 +12,7 @@ import uuid
 from typing import Optional
 from urllib.parse import urlparse
 
-MAX_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
 UPLOAD_ROOT = os.path.join("static", "uploads", "content")   # tests may point this elsewhere
 
 _TAG_RE = re.compile(r"<[^>]*>")
@@ -111,3 +111,11 @@ def public_url_for(file_name: str) -> str:
     if rel.startswith("static/"):
         rel = rel[len("static/"):]
     return f"{base}/static/{rel}/{file_name}"
+
+
+# Icons an admin may pick for a "What's New" feature row (the frontend maps each key to a lucide icon).
+WHATS_NEW_ICONS = (
+    "smartphone", "devices", "zap", "gift", "coins", "code", "toggle", "film", "sliders", "rocket",
+    "sparkles", "star", "heart", "shield", "globe", "bell", "video", "image", "wand", "palette",
+    "clock", "check", "users", "trophy", "flame", "layers", "cpu", "cloud", "mail", "lock",
+)

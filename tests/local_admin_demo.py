@@ -37,7 +37,10 @@ from fastapi import APIRouter
 import main
 from auth import get_password_hash
 from database import SessionLocal
-from models import User, PopupDisplay
+from datetime import datetime, timedelta
+from sqlalchemy import inspect, text
+from database import engine
+from models import User, PopupDisplay, Popup, OfferBanner
 from pricing_gateway import GatewayError
 from routers import pricing_router
 
@@ -108,8 +111,103 @@ def reset_popups():
 
 main.app.include_router(demo)
 
+# older demo databases were created before popups had button_color
+if "popups" in inspect(engine).get_table_names():
+    _have = {c["name"] for c in inspect(engine).get_columns("popups")}
+    with engine.begin() as conn:
+        for _name, _ddl in (("button_color", "VARCHAR"), ("text_color", "VARCHAR"), ("bg_color", "VARCHAR"),
+                            ("accent_color", "VARCHAR"), ("header_text", "VARCHAR"), ("footnote", "VARCHAR"),
+                            ("layout", "VARCHAR NOT NULL DEFAULT 'split'"),
+                            ("show_countdown", "BOOLEAN NOT NULL DEFAULT 0")):
+            if _name not in _have:
+                conn.execute(text(f"ALTER TABLE popups ADD COLUMN {_name} {_ddl}"))
+
+if "offer_banners" in inspect(engine).get_table_names():
+    _haveb = {c["name"] for c in inspect(engine).get_columns("offer_banners")}
+    with engine.begin() as conn:
+        for _name, _ddl in (("button_color", "VARCHAR"), ("text_color", "VARCHAR"), ("bg_color", "VARCHAR"),
+                            ("accent_color", "VARCHAR"), ("header_text", "VARCHAR"), ("badge_text", "VARCHAR"),
+                            ("show_countdown", "BOOLEAN NOT NULL DEFAULT 0")):
+            if _name not in _haveb:
+                conn.execute(text(f"ALTER TABLE offer_banners ADD COLUMN {_name} {_ddl}"))
+
+for _table in ("popups", "offer_banners"):
+    if _table in inspect(engine).get_table_names():
+        _haves = {c["name"] for c in inspect(engine).get_columns(_table)}
+        with engine.begin() as conn:
+            for _name, _ddl in (("bg_color2", "VARCHAR"), ("theme", "VARCHAR NOT NULL DEFAULT 'none'"),
+                                ("emoji", "VARCHAR"), ("font_style", "VARCHAR NOT NULL DEFAULT 'modern'"),
+                                ("bg_image_url", "VARCHAR"),
+                                ("display_mode", "VARCHAR NOT NULL DEFAULT 'designed'")):
+                if _name not in _haves:
+                    conn.execute(text(f"ALTER TABLE {_table} ADD COLUMN {_name} {_ddl}"))
+            if _table == "offer_banners" and "mobile_image_url" not in _haves:
+                conn.execute(text("ALTER TABLE offer_banners ADD COLUMN mobile_image_url VARCHAR"))
+
 db = SessionLocal()
 try:
+    # sample content so the admin pages (and the live popup / pricing banner) look good on first visit
+    _img = "https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?auto=format&fit=crop&q=80"
+    if db.query(Popup).filter(Popup.title == "Image-only popup (sample)").count() == 0:
+        db.add(Popup(title="Image-only popup (sample)", status="INACTIVE", target_audience="ALL", priority=1,
+                     display_mode="image", image_url=_img + "&w=1080&h=1350", button_link="/pricing"))
+    if db.query(OfferBanner).filter(OfferBanner.title == "Image-only banner (sample)").count() == 0:
+        db.add(OfferBanner(title="Image-only banner (sample)", is_active=False, display_mode="image",
+                           image_url=_img + "&w=1920&h=300", mobile_image_url=_img + "&w=800&h=400",
+                           button_link="/pricing"))
+    import whats_new as _wn
+    _wn.import_defaults(db)                   # What's New modal: start with the built-in content (no-op if present)
+    if db.query(Popup).filter(Popup.title == "Christmas Sale").count() == 0:
+        db.add(Popup(
+            title="Christmas Sale", status="ACTIVE", target_audience="ALL", priority=30, layout="stack",
+            header_text="MERRY CHRISTMAS", emoji="\U0001F385", theme="snow", font_style="elegant", show_countdown=True,
+            description="Wrap up the season with 3D motion videos. Unlock up to 50% off every plan.",
+            coupon_code="XMAS50", button_text="Claim my gift", button_link="/pricing",
+            footnote="*Offer valid for a limited time.",
+            bg_color="#7f1d1d", bg_color2="#14532d", text_color="#ffffff", accent_color="#fde68a", button_color="#dc2626",
+            start_at=datetime.utcnow() - timedelta(hours=1), end_at=datetime.utcnow() + timedelta(days=4)))
+    if db.query(Popup).filter(Popup.title == "SAVE UP TO 75% OFF").count() == 0:
+        db.add(Popup(
+            title="SAVE UP TO 75% OFF", status="ACTIVE", target_audience="ALL", priority=20, layout="stack",
+            header_text="WAIT! BONUS SPECIAL OFFER!", show_countdown=True,
+            description="***LIMITED TIME DEAL***\nThis offer happens once a year, so take action TODAY before it goes away!",
+            button_text="CLAIM MY DISCOUNT!", button_link="/pricing", footnote="*Discount is automatically applied to your purchase.",
+            bg_color="#0b1c33", text_color="#ffffff", accent_color="#facc15", button_color="#6d5df6",
+            start_at=datetime.utcnow() - timedelta(days=1), end_at=datetime.utcnow() + timedelta(hours=26)))
+    if db.query(Popup).filter(Popup.title == "Summer Sale: 30% OFF").count() == 0:
+        db.add(Popup(
+            title="Summer Sale: 30% OFF", status="ACTIVE", target_audience="ALL", priority=5,
+            bg_color="#ffffff", text_color="#111111", accent_color="#8a6d12",
+            description="Turn your photos into stunning 3D motion videos.\nUpgrade this week and save on every plan.",
+            image_url="https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?auto=format&fit=crop&w=800&q=80",
+            button_text="Upgrade now", button_link="/pricing", button_color="#c9a93b", coupon_code="SUMMER30",
+            start_at=datetime.utcnow() - timedelta(days=1), end_at=datetime.utcnow() + timedelta(days=30)))
+        db.add(Popup(
+            title="Welcome to DepthFlow", status="INACTIVE", target_audience="FREE", priority=1,
+            description="Start with a free render and explore before upgrading.",
+            button_text="See plans", button_link="/pricing", button_color="#7c3aed"))
+    if db.query(OfferBanner).filter(OfferBanner.title == "Christmas Sale").count() == 0:
+        db.add(OfferBanner(
+            title="Christmas Sale", is_active=True, header_text="MERRY CHRISTMAS", badge_text="UP TO 50% OFF",
+            emoji="\U0001F384", theme="lights", font_style="elegant",
+            description="Give the gift of 3D motion. Save on every plan this festive season.",
+            coupon_code="XMAS50", button_text="Shop plans", button_link="/pricing", show_countdown=True,
+            bg_color="#7f1d1d", bg_color2="#14532d", text_color="#ffffff", accent_color="#fde68a", button_color="#dc2626",
+            start_at=datetime.utcnow() - timedelta(minutes=5), end_at=datetime.utcnow() + timedelta(days=4)))
+    if db.query(OfferBanner).filter(OfferBanner.title == "Black Friday Mega Sale").count() == 0:
+        db.add(OfferBanner(
+            title="Black Friday Mega Sale", is_active=True, header_text="END OF SEASON", badge_text="50% OFF",
+            description="Upgrade any plan and turn more photos into 3D motion videos. Offer ends soon.",
+            coupon_code="BLACKFRIDAY", button_text="Shop plans", button_link="/pricing", show_countdown=True,
+            bg_color="#120d2b", text_color="#ffffff", accent_color="#facc15", button_color="#7c3aed",
+            start_at=datetime.utcnow() - timedelta(hours=1), end_at=datetime.utcnow() + timedelta(days=3)))
+    if db.query(OfferBanner).count() == 0:
+        db.add(OfferBanner(
+            title="Summer Sale: 30% OFF all plans", is_active=True, coupon_code="SUMMER30",
+            description="Use the code at checkout. Ends in 30 days.",
+            button_text="View plans", button_link="/pricing",
+            start_at=datetime.utcnow() - timedelta(days=1), end_at=datetime.utcnow() + timedelta(days=30)))
+    db.commit()
     for email, kw in {
         "demo_admin@example.com": dict(is_admin=True, plan="free"),
         "demo_free@example.com": dict(plan="free"),

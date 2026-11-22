@@ -144,6 +144,20 @@ class Popup(Base):
     button_text = Column(String, nullable=True)
     button_link = Column(String, nullable=True)
     coupon_code = Column(String, nullable=True)
+    button_color = Column(String, nullable=True)                       # "#RRGGBB"; null = app default
+    text_color = Column(String, nullable=True)
+    bg_color = Column(String, nullable=True)
+    accent_color = Column(String, nullable=True)                       # title + header strip
+    header_text = Column(String, nullable=True)                        # strip across the top of the card
+    footnote = Column(String, nullable=True)                           # small print under the button
+    layout = Column(String, nullable=False, default="split")          # split | stack
+    show_countdown = Column(Boolean, nullable=False, default=False)   # counts down to end_at
+    bg_color2 = Column(String, nullable=True)
+    theme = Column(String, nullable=False, default="none")             # none|snow|lights|confetti|sparkles|rain
+    emoji = Column(String, nullable=True)
+    font_style = Column(String, nullable=False, default="modern")      # modern|elegant|bold
+    bg_image_url = Column(String, nullable=True)
+    display_mode = Column(String, nullable=False, default="designed")   # designed | image
     target_audience = Column(String, nullable=False, default="ALL")    # ALL | FREE | PAID
     start_at = Column(DateTime, nullable=True)                         # null = immediately
     end_at = Column(DateTime, nullable=True)                           # null = no expiry
@@ -179,9 +193,60 @@ class OfferBanner(Base):
     button_text = Column(String, nullable=True)
     button_link = Column(String, nullable=True)
     coupon_code = Column(String, nullable=True)
+    button_color = Column(String, nullable=True)
+    text_color = Column(String, nullable=True)
+    bg_color = Column(String, nullable=True)
+    accent_color = Column(String, nullable=True)
+    header_text = Column(String, nullable=True)
+    badge_text = Column(String, nullable=True)
+    show_countdown = Column(Boolean, nullable=False, default=False)
+    bg_color2 = Column(String, nullable=True)
+    theme = Column(String, nullable=False, default="none")             # none|snow|lights|confetti|sparkles|rain
+    emoji = Column(String, nullable=True)
+    font_style = Column(String, nullable=False, default="modern")      # modern|elegant|bold
+    bg_image_url = Column(String, nullable=True)
+    display_mode = Column(String, nullable=False, default="designed")   # designed | image
+    mobile_image_url = Column(String, nullable=True)
     start_at = Column(DateTime, nullable=True)
     end_at = Column(DateTime, nullable=True)
     is_active = Column(Boolean, nullable=False, default=False)
+    created_by_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class PromoTemplate(Base):
+    """A design an admin saved to reuse for popups / banners (festival looks etc.). `data` is validated JSON."""
+    __tablename__ = "promo_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    kind = Column(String, nullable=False, index=True)      # popup | banner
+    name = Column(String, nullable=False)
+    emoji = Column(String, nullable=True)
+    data = Column(Text, nullable=False)                     # JSON of the design/content fields
+    end_in_days = Column(Integer, nullable=True)
+    created_by_user_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class WhatsNewRelease(Base):
+    """One tab of the "What's New" modal. `features` is a JSON list of {icon, title, description}."""
+    __tablename__ = "whats_new_releases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tab_label = Column(String, nullable=False)
+    badge_text = Column(String, nullable=True)
+    title = Column(String, nullable=False)
+    subtitle = Column(Text, nullable=True)
+    features = Column(Text, nullable=False, default="[]")
+    button1_text = Column(String, nullable=True)
+    button1_link = Column(String, nullable=True)
+    button1_style = Column(String, nullable=False, default="light")    # google_play | light | dark
+    button2_text = Column(String, nullable=True)
+    button2_link = Column(String, nullable=True)                       # empty = just closes the modal
+    auto_show = Column(Boolean, nullable=False, default=False)         # open once for users who have not seen it
+    status = Column(String, nullable=False, default="INACTIVE")        # ACTIVE | INACTIVE | ARCHIVED
+    display_order = Column(Integer, nullable=False, default=0)         # tabs left -> right; ties: newest first
     created_by_user_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)

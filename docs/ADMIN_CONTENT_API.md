@@ -97,3 +97,46 @@ JPEG / PNG / WebP only (checked by file contents, not name), max 2 MB (413 above
 - `image_url`: http(s) URL or in-app path.
 - HTML tags are removed from all text fields; control characters removed.
 - Only admins can reach any `/admin/*` endpoint.
+
+
+## What's New window (`whats_new_releases`)
+
+Each release is one **tab** of the "What's New" modal. Tabs are ordered by `display_order` (ties: newest first); the first
+tab is rendered in the "latest" style.
+
+### Public (no login)
+`GET /whats-new` ->
+```json
+{
+  "releases": [{
+    "id": 3, "tab_label": "Latest: App Launch", "badge_text": "New App Launch", "title": "...", "subtitle": "...",
+    "features": [{"icon": "rocket", "title": "Faster", "description": "..."}],
+    "button1_text": "Google Play", "button1_link": "https://...", "button1_style": "google_play",
+    "button2_text": "Continue to Web", "button2_link": null
+  }],
+  "announce_version": 3
+}
+```
+- Only `ACTIVE` releases are returned. When the list is empty the frontend shows its built-in content.
+- `announce_version` is the id of the newest active release with `auto_show = true` (or `null`). The browser opens the
+  modal once when this differs from what it stored (`localStorage.whatsNewSeenVersion`). Editing a release does **not**
+  change it; publishing a new auto-show release does.
+- `icon` is one of `content_validation.WHATS_NEW_ICONS` (smartphone, devices, zap, gift, coins, code, toggle, film,
+  sliders, rocket, sparkles, star, heart, shield, globe, bell, video, image, wand, palette, clock, check, users, trophy,
+  flame, layers, cpu, cloud, mail, lock).
+- `button*_link`: `https://...` opens in a new tab, `/path` navigates in the app and closes the modal, `null` just closes it.
+  `button1_style`: `google_play` (needs an https link) | `light` | `dark`.
+
+### Admin (`is_admin`)
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/admin/whats-new?include_archived=` | list + `has_any` |
+| POST | `/admin/whats-new` | create (201) |
+| GET/PUT | `/admin/whats-new/{id}` | archived releases cannot be edited (409) |
+| PATCH | `/admin/whats-new/{id}/status` | `ACTIVE` / `INACTIVE` / `ARCHIVED` |
+| DELETE | `/admin/whats-new/{id}` | archive (soft delete) |
+| POST | `/admin/whats-new/reorder` | `{items: [{id, display_order}]}` |
+| POST | `/admin/whats-new/import-defaults` | one-time import of the built-in "App Launch" + "Version 2.0" tabs (409 if any exist) |
+
+Validation: text is stripped of HTML; `tab_label` <= 30, `title` <= 120, `subtitle` <= 400, <= 12 features (title <= 80,
+description <= 240), link rules as for popups.

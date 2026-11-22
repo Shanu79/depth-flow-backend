@@ -14,14 +14,16 @@ Applies to branch `feature/admin-pricing-popups` in **both** repos (backend and 
 ## 0. Before you deploy
 
 - [ ] Commit both repos' `feature/admin-pricing-popups` branches and review the diffs. (They are **not** committed or pushed yet.)
-- [ ] Decide the merge order: **this feature first, Happy Hour after.** When Happy Hour is rebased onto it, expect conflicts in
-      `main.py`, `models.py` and `routers/payments_router.py`, and its migration `a7c1e5d2f9b3` must be re-pointed so its
-      `down_revision` is `c5d7a1f3e902`.
+- [ ] **Deploy the two features together, from the `integration/admin-and-happy-hour` branch** (it already contains both, with the
+      three merge conflicts in `main.py`, `models.py` and `routers/payments_router.py` resolved and tested). The two Alembic chains
+      both start at `b045d750bfe0`, so the branch adds the merge migration `f1a2b3c4d5e6`; the single head is `f1a2b3c4d5e6`.
+      Do not deploy one feature alone from its own branch after the other has been applied to the database, and do not re-point
+      the Happy Hour migrations (that breaks databases that already ran them).
 - [ ] Confirm the **frontend production API URL** is correct in `src/config.js`. `REACT_APP_DEV_API` is a dev-only override
       and must not be set in the production build.
 - [ ] Back up the production database (for Postgres: `pg_dump`). Keep the file until step 8 is done.
 - [ ] Run the checks locally one last time:
-      `python tests/test_pricing_popups.py` (expect 29/29) and `npx react-scripts test --watchAll=false src/components` in the frontend (expect all pass).
+      `python tests/test_pricing_popups.py` (expect 29/29; on the integration branch also `tests/test_happy_hour.py` 22/22, `tests/test_notifications.py` 10/10 and `tests/test_integration_merge.py` 4/4) and `npx react-scripts test --watchAll=false src/components` in the frontend (expect all pass).
 
 ## 1. Server configuration
 
@@ -40,7 +42,7 @@ Applies to branch `feature/admin-pricing-popups` in **both** repos (backend and 
 - [ ] Deploy the backend.
 - [ ] Run `alembic current` (expect `b045d750bfe0`), then `alembic upgrade head`. The migration is idempotent: the app also
       runs `create_all` at startup, so a table that already exists is skipped.
-- [ ] `alembic heads` shows a single head: `c5d7a1f3e902`.
+- [ ] `alembic heads` shows a single head: `f1a2b3c4d5e6` on the integration branch (`c5d7a1f3e902` if you deploy this feature alone).
 - [ ] These tables exist: `pricing_plans`, `plan_prices`, `popups`, `popup_displays`, `offer_banners`, `promo_templates`, `whats_new_releases`.
 
 ## 3. Backend smoke test (before the frontend goes out)

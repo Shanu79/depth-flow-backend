@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field, StrictInt
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -7,6 +8,8 @@ from database import get_db
 from models import User
 from schemas import UserResponse, UserUpdate 
 from auth import get_current_user
+import happy_hour as hh
+import notifications as nt
 
 router = APIRouter(prefix="/admin", tags=["Admin Dashboard"])
 
@@ -106,3 +109,55 @@ def update_user(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail=f"Failed to update user: {str(e)}"
         )
+
+
+# --- HAPPY HOUR SETTINGS (no code change / deploy needed) ---
+class HappyHourSettings(BaseModel):
+    # StrictInt: "10" / 10.5 / true are rejected; gt=0 -> positive integers only.
+    max_videos_per_session: StrictInt = Field(gt=0, le=hh.MAX_VIDEOS_CEILING)
+
+
+@router.get("/settings/happy-hour")
+def get_happy_hour_settings(db: Session = Depends(get_db), admin: User = Depends(get_current_admin)):
+    return {
+        "max_videos_per_session": hh.get_max_videos(db),
+        "default": hh.DEFAULT_MAX_VIDEOS,
+        "max_allowed": hh.MAX_VIDEOS_CEILING,
+        "note": "Applies to Happy Hour sessions activated after the change; running sessions keep their snapshot.",
+    }
+
+
+@router.put("/settings/happy-hour")
+def update_happy_hour_settings(body: HappyHourSettings, db: Session = Depends(get_db),
+                               admin: User = Depends(get_current_admin)):
+    try:
+        value = hh.set_max_videos(db, body.max_videos_per_session, admin.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "success", "max_videos_per_session": value}
+
+
+# --- HAPPY HOUR BROADCAST (admin announcement -> every recipient's inbox + their Android devices) ---
+class HappyHourBroadcast(BaseModel):
+    title: str = Field(min_length=1, max_length=65)
+    body: str = Field(min_length=1, max_length=240)
+    # eligible        = subscribers who could activate a token right now (tokens left, not used this month,
+    #                   no running session)
+    # all_subscribers = every active Monthly/Yearly workspace subscriber
+    audience: str = Field(default="eligible", pattern="^(eligible|all_subscribers)$")
+    dry_run: bool = False       # true = only report how many people/devices would be reached
+
+
+@router.post("/notifications/happy-hour-broadcast")
+def send_happy_hour_broadcast(body: HappyHourBroadcast, db: Session = Depends(get_db),
+                              admin: User = Depends(get_current_admin)):
+    try:
+        return nt.send_happy_hour_broadcast(db, admin.id, body.title.strip(), body.body.strip(),
+                                            body.audience, body.dry_run)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/notifications/broadcasts")
+def list_broadcasts(limit: int = 50, db: Session = Depends(get_db), admin: User = Depends(get_current_admin)):
+    return nt.list_broadcasts(db, max(1, min(limit, 200)))

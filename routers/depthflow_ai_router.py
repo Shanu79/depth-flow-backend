@@ -11,8 +11,9 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, B
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, GenerationHistory
+from models import User, GenerationHistory, HappyHourSession
 from auth import get_current_user
+from happy_hour import begin_generation, confirm_generation, release_generation, remaining_videos
 
 router = APIRouter(prefix="/ai/depthflow", tags=["DepthFlow Generation"])
 
@@ -107,8 +108,17 @@ async def generate_depthflow(
     elif duration > 10:
         dynamic_cost += 5
 
-    # 2. ENHANCED VALIDATION
-    if current_user.credits < dynamic_cost:
+    # 2. HAPPY HOUR: active subscription + live server-side session + free video slot => unlimited, zero
+    # credits. Otherwise (no session / expired / sub inactive / cap reached) normal validation. The slot is
+    # reserved now and confirmed (success) or released (failure) below.
+    hh_grant = begin_generation(db, current_user)
+    unlimited = hh_grant is not None
+    hh_confirmed = False
+    if unlimited:
+        dynamic_cost = 0
+
+    # 3. ENHANCED VALIDATION
+    if not unlimited and current_user.credits < dynamic_cost:
         raise HTTPException(
             status_code=402, 
             detail=f"❌ Payment Required: This API call costs {dynamic_cost} credits. You currently have {current_user.credits} credits."
@@ -162,10 +172,16 @@ async def generate_depthflow(
         db.add(new_history)
         
         # 3. DEDUCT DYNAMIC CREDITS 
-        current_user.credits -= dynamic_cost
-        
+        if unlimited:
+            confirm_generation(db, hh_grant)  # slot reserved -> used, same commit as the history row
+        else:
+            current_user.credits -= dynamic_cost
+
         background_tasks.add_task(cleanup_old_files)
-        db.commit() # Saves the history AND the new credit balance
+        db.commit() # Saves the history AND the new credit balance / happy hour slot
+        hh_confirmed = True
+
+        hh_session = db.get(HappyHourSession, hh_grant.session_id) if unlimited else None
 
         # 4. RETURN USAGE HEADERS
         return FileResponse(
@@ -179,7 +195,9 @@ async def generate_depthflow(
                 "X-Cost": str(dynamic_cost),  # <-- Return the dynamic cost to frontend
                 "X-Remaining-Credits": str(current_user.credits),
                 "X-History-ID": str(new_history.id),
-                "X-Video-URL": final_url
+                "X-Video-URL": final_url,
+                "X-Happy-Hour": "active" if unlimited else "inactive",
+                "X-Happy-Hour-Remaining-Videos": str(remaining_videos(hh_session))
             }
         )
 
@@ -191,6 +209,10 @@ async def generate_depthflow(
         print(f"Server Error (DepthFlow): {e}")
         if os.path.exists(temp_raw_video): os.remove(temp_raw_video)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Failed generations never consume Happy Hour video allowance.
+        if hh_grant is not None and not hh_confirmed:
+            release_generation(db, hh_grant)
 
 # --- NEW ENDPOINT: GET HISTORY ---
 @router.get("/logs")

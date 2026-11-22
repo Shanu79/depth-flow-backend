@@ -67,13 +67,22 @@ class ResetPasswordReq(BaseModel):
 # ==========================================
 # HELPER: SEND OTP EMAIL VIA ZEPTOMAIL API
 # ==========================================
+def _zeptomail_auth_header() -> str:
+    """Authorization header value, built from the ZEPTOMAIL_SEND_TOKEN env var (never hard-code it)."""
+    token = (ZEPTOMAIL_SEND_TOKEN or "").strip()
+    return token if token.lower().startswith("zoho-enczapikey") else f"Zoho-enczapikey {token}"
+
+
 def send_otp_email(receiver_email: str, otp: str):
+    if not (ZEPTOMAIL_SEND_TOKEN or "").strip():
+        print("Failed to send ZeptoMail: ZEPTOMAIL_SEND_TOKEN is not set")
+        return
     url = "https://api.zeptomail.in/v1.1/email"
 
     headers = {
         'accept': "application/json",
         'content-type': "application/json",
-        'authorization': "Zoho-enczapikey PHtE6r1eE7rui24npEcJsfK+HpKiPI4m9e42KFNPtN5GXv4FGk1U/9l9lDLlrhsqAKURFPLOzIlr5L6c4e+CITrvZzxIWWqyqK3sx/VYSPOZsbq6x00Vt1oedUTVU4PsddFq1SDfu97eNA==",
+        'authorization': _zeptomail_auth_header(),
     }
     
     # Modern, Dark-Mode HTML Email Template

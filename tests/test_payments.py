@@ -10,9 +10,9 @@ from standardwebhooks.webhooks import Webhook
 # ==========================================
 BASE_URL = "http://localhost:8000"
 # Get a valid JWT token from a logged-in test user
-ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyQGV4YW1wbGUuY29tIiwiZXhwIjoxNzc5ODIyNjg5fQ.Vv1LAMvReWsM_iLxwHewdhaEGTuGK1_ZQacAKoad5e4" 
-# Your local Dodo Webhook Secret (from your .env)
-WEBHOOK_SECRET = "whsec_BjJ521s4BJnSWdfMndLthomoC0SIL9Ie"
+ACCESS_TOKEN = os.environ.get("TEST_ACCESS_TOKEN", "YOUR_BEARER_TOKEN_HERE") 
+# Webhook secret comes from the DODO_WEBHOOK_SECRET env var (never commit it)
+WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET", "")
 
 HEADERS = {
     "Authorization": f"Bearer {ACCESS_TOKEN}",
@@ -299,7 +299,7 @@ def run_tests():
         print("❌ FAILED: Duplicate webhook was processed.")
 
 if __name__ == "__main__":
-    if ACCESS_TOKEN == "YOUR_BEARER_TOKEN_HERE":
-        print("ERROR: Please set your ACCESS_TOKEN and WEBHOOK_SECRET in the script.")
+    if ACCESS_TOKEN == "YOUR_BEARER_TOKEN_HERE" or not WEBHOOK_SECRET:
+        print("ERROR: Set the TEST_ACCESS_TOKEN and DODO_WEBHOOK_SECRET environment variables.")
     else:
         run_tests()

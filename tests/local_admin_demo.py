@@ -3,6 +3,7 @@ Run the admin features (pricing, popups, offer banner) locally WITHOUT touching 
 
     python tests/local_admin_demo.py            # keeps the demo data between runs
     python tests/local_admin_demo.py --reset    # start from an empty demo database
+    python tests/local_admin_demo.py --port 8020   # run on another port (own database file)
 
 What it does
   * serves the real app on http://localhost:8010 using a throw-away SQLite file in your temp folder
@@ -25,11 +26,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
-DB = os.path.join(tempfile.gettempdir(), "depthflow_admin_demo.db")
+PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 8010   # --port N: run beside another demo
+DB = os.path.join(tempfile.gettempdir(), "depthflow_admin_demo.db" if PORT == 8010 else f"depthflow_admin_demo_{PORT}.db")
 if "--reset" in sys.argv and os.path.exists(DB):
     os.remove(DB)
 os.environ["DATABASE_URL"] = "sqlite:///" + DB.replace("\\", "/")       # never your real DB
-os.environ["BASE_URL"] = "http://localhost:8010"
+os.environ["BASE_URL"] = f"http://localhost:{PORT}"
 
 import uvicorn
 from fastapi import APIRouter
@@ -83,6 +85,39 @@ class FakeGateway:
 
 GW = FakeGateway()
 main.app.dependency_overrides[pricing_router.get_gateway] = lambda: GW
+
+
+# The demo users have made-up subscription ids ("sub_seed_*", "sub_demo"). The app syncs a user's subscription with Dodo on
+# every page load and treats "404 not found" as "cancelled" (which also voids Happy Hour tokens), so answer for those ids
+# locally. Real subscription ids still go to Dodo.
+from types import SimpleNamespace  # noqa: E402
+from routers import payments_router as _pr  # noqa: E402
+
+
+class _SubsProxy:
+    def __init__(self, real):
+        self._real = real
+
+    def retrieve(self, subscription_id, **kw):
+        if str(subscription_id).startswith(("sub_seed_", "sub_demo")):
+            return SimpleNamespace(status="active", product_id="pdt_0NUQxXJa0TR6vJJznsrt2",
+                                   cancel_at_next_billing_date=False, next_billing_date=None)
+        return self._real.retrieve(subscription_id=subscription_id, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _ClientProxy:
+    def __init__(self, real):
+        self._real = real
+        self.subscriptions = _SubsProxy(real.subscriptions)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+_pr.client = _ClientProxy(_pr.client)
 
 demo = APIRouter(prefix="/__demo", tags=["demo helpers"])
 
@@ -227,6 +262,6 @@ try:
 finally:
     db.close()
 
-print("\nAdmin demo backend: http://localhost:8010   (fake payment gateway, temp DB: %s)" % DB)
+print("\nAdmin demo backend: http://localhost:%d   (fake payment gateway, temp DB: %s)" % (PORT, DB))
 print("Logins (password Demo@12345): demo_admin@example.com | demo_free@example.com | demo_paid@example.com\n", flush=True)
-uvicorn.run(main.app, host="127.0.0.1", port=8010, log_level="warning")
+uvicorn.run(main.app, host="127.0.0.1", port=PORT, log_level="warning")

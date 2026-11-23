@@ -2,7 +2,7 @@ import os
 import logging
 import base64
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
@@ -16,6 +16,9 @@ from standardwebhooks.webhooks import Webhook as StandardWebhook
 from database import get_db
 from models import User
 from auth import get_current_user
+import pricing
+import happy_hour as hh
+import notifications as nt
 
 # --- SETUP ---
 logging.basicConfig(level=logging.INFO)
@@ -27,43 +30,22 @@ DODO_API_KEY = os.environ.get("DODO_PAYMENTS_API_KEY")
 WEBHOOK_SECRET = os.environ.get("DODO_WEBHOOK_SECRET")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
+# "live_mode" (default, so production is unchanged unless you opt in) or "test_mode" for rehearsals / staging.
+DODO_ENVIRONMENT = os.environ.get("DODO_ENVIRONMENT", "live_mode").strip()
+if DODO_ENVIRONMENT not in ("live_mode", "test_mode"):
+    raise RuntimeError(f"DODO_ENVIRONMENT must be 'live_mode' or 'test_mode', got {DODO_ENVIRONMENT!r}")
+logger.info("Dodo Payments environment: %s", DODO_ENVIRONMENT)
+
 client = DodoPayments(
     bearer_token=DODO_API_KEY,
-    environment="live_mode" 
+    environment=DODO_ENVIRONMENT,
 )
 
-# SINGLE SOURCE OF TRUTH FOR CREDITS
-PLAN_CONFIG = {
-    "monthly": {
-        "Basic": {"id": "pdt_0NUQxXnGKlkhrpGBAFMvy", "credits": 600},
-        "Pro":   {"id": "pdt_0NUQxXJa0TR6vJJznsrt2", "credits": 1500},
-        "Premium":   {"id": "pdt_0Nc5Ts7erauRnehAFJV6Q", "credits": 4000},
-    },
-    "yearly": {
-        "Basic": {"id": "pdt_0NUQxWNFaRWTd8eoNkqoJ", "credits": 7200},
-        "Pro":   {"id": "pdt_0NUQxVyW088PIAwIzObuC", "credits": 18000},
-        "Premium": {"id": "pdt_0Nc5TfN5t1oLCfoeNN7AZ", "credits": 48000},
-    }
-}
-
-# --- NEW: API PLANS ---
-API_PLAN_CONFIG = {
-    "monthly": {
-        "Starter API": {"id": "pdt_0Nbt4jmPtgBIPmJgF3qdh", "credits": 10000},
-        "Growth API":  {"id": "pdt_0NbtLLrNFAwrGkvpH0lGQ", "credits": 30000},
-        "Pro API":     {"id": "pdt_0Nbt4bIY0qlHH3u8SMyyD", "credits": 65000},
-    },
-    "yearly": {
-        "Starter API": {"id": "dummy_api_starter_yearly", "credits": 120000},
-        "Growth API":  {"id": "dummy_api_growth_yearly", "credits": 324000},
-        "Pro API":     {"id": "dummy_api_pro_yearly", "credits": 720000},
-    }
-}
-
-ONE_TIME_PLANS = {
-    # "Trial": {"id": "pdt_0NUQxWtv1A7PDo75MPx9L", "credits": 120},
-    "Credit Pack": {"id": "pdt_0NYCtBgPqWWzyF6yKrE98", "credits": 900},
-}
+# Plan catalogue (product ids, credits, prices) now lives in the DB and is managed from the Admin Panel
+# (see pricing.py). These names are kept as the legacy fallback used until the plans are imported.
+PLAN_CONFIG = pricing.LEGACY_PLAN_CONFIG
+API_PLAN_CONFIG = pricing.LEGACY_API_PLAN_CONFIG
+ONE_TIME_PLANS = pricing.LEGACY_ONE_TIME_PLANS
 
 # Add this alongside your other PLAN_CONFIGs
 GOOGLE_PLAY_PLANS = {
@@ -72,6 +54,70 @@ GOOGLE_PLAY_PLANS = {
     "sub_basic_yr": 7200,
     "sub_pro_yr": 18000
 }
+
+# --- HAPPY HOUR HELPERS (token grants ride on the existing billing events) ---
+def _naive_utc(value) -> Optional[datetime]:
+    """Dodo/Google dates -> naive UTC datetime (the convention used across this backend)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _play_expiry(result: dict) -> Optional[datetime]:
+    try:
+        return datetime.utcfromtimestamp(int(result["expiryTimeMillis"]) / 1000)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _dodo_period_end(subscription_id: Optional[str]) -> Optional[datetime]:
+    """End of the current paid period (Dodo's next_billing_date); None if it can't be fetched."""
+    if not subscription_id:
+        return None
+    try:
+        sub = client.subscriptions.retrieve(subscription_id=subscription_id)
+        return _naive_utc(getattr(sub, "next_billing_date", None))
+    except Exception as e:
+        logger.warning(f"Could not fetch Dodo period end for {subscription_id}: {e}")
+        return None
+
+
+def _grant_happy_hour(db: Session, user: User, *, subscription_id, grant_ref, cycle, expiry, source):
+    """
+    Grant this billing period's Happy Hour tokens. Runs AFTER the main billing commit, in its own
+    transaction, so a Happy Hour problem can never roll back or block credits/plan changes. Idempotent on
+    `grant_ref` (payment/order id). If it ever fails, the entitlement is lazily bootstrapped on first use.
+    """
+    try:
+        cycle = (cycle or "").lower()
+        if cycle not in ("monthly", "yearly") or (user.plan or "").strip().lower() in hh._NON_SUBSCRIPTION_PLANS:
+            return
+        if expiry:
+            user.subscription_end_date = expiry
+        already_granted = bool(grant_ref) and (hh.get_entitlement(db, user.id) is not None
+                                               and hh.get_entitlement(db, user.id).last_grant_ref == grant_ref)
+        ent = hh.grant_entitlement(db, user, cycle, subscription_id, grant_ref, expiry=expiry, source=source)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Happy Hour grant failed for user {getattr(user, 'id', '?')}: {e}")
+        return
+
+    # Notify (inbox + Android push). Separate from the grant: it can never undo it, and the dedupe key
+    # makes a replayed webhook silent.
+    if ent is not None and not already_granted:
+        try:
+            nt.notify_token_granted(db, user.id, ent, grant_ref)
+        except Exception as e:
+            logger.warning(f"Happy Hour grant notification failed for user {user.id}: {e}")
+
 
 async def process_renewal(purchase_token: str, db: Session):
     try:
@@ -116,6 +162,10 @@ async def process_renewal(purchase_token: str, db: Session):
 
             user.last_payment_id = order_id
             db.commit()
+            # Happy Hour: renewal => new period's token allocation (monthly: reset to 1, yearly: 4)
+            _grant_happy_hour(db, user, subscription_id=purchase_token, grant_ref=order_id,
+                              cycle="yearly" if product_id.endswith("_yr") else "monthly",
+                              expiry=_play_expiry(result), source="google_play")
             logger.info(f"Successfully processed background renewal for {user.email}")
         else:
             logger.warning(f"Subscription renewal not in valid state: {result.get('paymentState')}")
@@ -165,37 +215,24 @@ async def create_checkout_session(
     # STEP 1: VALIDATE PLAN (One-Time vs Recurring)
     # ---------------------------------------------------------
     
-    # CASE A: ONE-TIME PAYMENT
-    if request.billing_cycle == "one_time":
-        plan_data = ONE_TIME_PLANS.get(request.plan_name)
-        if not plan_data:
-            raise HTTPException(status_code=400, detail="Invalid one-time plan")
-        
-        target_product_id = plan_data["id"]
+    # The plan, its Dodo product and its credits are ALWAYS resolved on the backend (never from the request).
+    try:
+        resolved = pricing.resolve_for_checkout(db, request.plan_name, request.billing_cycle)
+    except pricing.PlanUnavailable as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
 
-        if request.plan_name == "Trial":
-            if current_user.plan == "Trial":
-                raise HTTPException(status_code=403, detail="You already have the Trial pack.")
-            
-            already_bought = check_if_already_purchased(current_user.email, target_product_id)
-            if already_bought:
-                raise HTTPException(status_code=403, detail="You have already used the Trial pack in the past.")
+    target_product_id = resolved.product_id
+    credits_to_add = resolved.credits
+    is_one_time = resolved.is_one_time
+    is_api_plan = resolved.is_api
 
-        credits_to_add = plan_data["credits"]
-        is_one_time = True
+    if is_one_time and request.plan_name == "Trial":
+        if current_user.plan == "Trial":
+            raise HTTPException(status_code=403, detail="You already have the Trial pack.")
 
-    # CASE B: RECURRING SUBSCRIPTION
-    else:
-        if request.billing_cycle in PLAN_CONFIG and request.plan_name in PLAN_CONFIG[request.billing_cycle]:
-            plan_data = PLAN_CONFIG[request.billing_cycle][request.plan_name]
-        elif request.billing_cycle in API_PLAN_CONFIG and request.plan_name in API_PLAN_CONFIG[request.billing_cycle]:
-            plan_data = API_PLAN_CONFIG[request.billing_cycle][request.plan_name]
-            is_api_plan = True
-        else:
-            raise HTTPException(status_code=400, detail=f"Invalid plan: {request.plan_name}")
-
-        target_product_id = plan_data["id"]
-        credits_to_add = plan_data["credits"]
+        already_bought = check_if_already_purchased(current_user.email, target_product_id)
+        if already_bought:
+            raise HTTPException(status_code=403, detail="You have already used the Trial pack in the past.")
 
     # Grab the old sub ID so we can cancel it AFTER they pay for the new one
     if is_api_plan:
@@ -359,13 +396,16 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                     credits_to_add = int(metadata.get("credits_to_add"))
                     source = "Metadata (New/One-Time/Upgrade)"
                 elif is_renewal:
-                    config_map = API_PLAN_CONFIG if is_api else PLAN_CONFIG
                     active_cycle = user.api_billing_cycle if is_api else user.billing_cycle
                     active_plan = user.api_plan if is_api else user.plan
-                    
-                    current_cycle = config_map.get(active_cycle, {})
-                    current_plan = current_cycle.get(active_plan, {})
-                    credits_to_add = current_plan.get("credits", 0)
+                    # Prefer the exact product this payment is for, so price/credit changes on a newer product
+                    # never alter what an existing subscriber receives.
+                    paid_product_id = data.get("product_id")
+                    if not paid_product_id:
+                        cart = data.get("product_cart") or []
+                        if cart and isinstance(cart[0], dict):
+                            paid_product_id = cart[0].get("product_id")
+                    credits_to_add = pricing.renewal_credits(db, active_plan, active_cycle, is_api, paid_product_id)
                     source = f"Auto-Renewal ({active_plan})"
 
                 # --- 3. ADD / RESET CREDITS ---
@@ -431,6 +471,13 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
 
                 db.commit() # Important: Commit the NEW sub_id first
 
+                # --- HAPPY HOUR: new purchase / renewal of a WORKSPACE subscription grants this period's tokens.
+                # Plan changes arrive as a new subscription -> the entitlement is replaced, never stacked.
+                if not is_one_time and not is_api and new_sub_id:
+                    _grant_happy_hour(db, user, subscription_id=new_sub_id, grant_ref=payment_id,
+                                      cycle=user.billing_cycle, expiry=_dodo_period_end(new_sub_id),
+                                      source="dodo")
+
                 # --- 5. CLEANUP OLD SUBSCRIPTION ---
                 old_sub_id = metadata.get("old_sub_id")
                 if old_sub_id and old_sub_id != new_sub_id:
@@ -456,25 +503,21 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                 is_api = user.api_subscription_id == sub_id
                 if is_api:
                     user.api_subscription_status = status
-                    config_map = API_PLAN_CONFIG
                 else:
                     user.subscription_status = status
-                    config_map = PLAN_CONFIG
-                
-                # Keep Plan in Sync
-                found_plan = False
-                for cycle, plans in config_map.items():
-                    for p_name, p_data in plans.items():
-                        if p_data["id"] == product_id:
-                            if is_api:
-                                user.api_plan = p_name
-                                user.api_billing_cycle = cycle
-                            else:
-                                user.plan = p_name
-                                user.billing_cycle = cycle
-                            found_plan = True
-                            break
-                    if found_plan: break
+                    if (status or "").lower() in ("cancelled", "canceled", "expired", "failed"):
+                        hh.invalidate_entitlement(db, user, hh.ENT_CANCELLED)  # unused tokens void, session ends
+
+                # Keep Plan in Sync (matches retired product versions too, so old subscribers still resolve)
+                found = pricing.resolve_by_product_id(db, product_id, is_api)
+                if found:
+                    p_name, cycle = found
+                    if is_api:
+                        user.api_plan = p_name
+                        user.api_billing_cycle = cycle
+                    else:
+                        user.plan = p_name
+                        user.billing_cycle = cycle
                 
                 db.commit()
 
@@ -493,6 +536,7 @@ async def dodo_webhook(request: Request, db: Session = Depends(get_db)):
                     user.api_billing_cycle = None
                 elif user.subscription_id == sub_id:
                     user.subscription_status = "cancelled"
+                    hh.invalidate_entitlement(db, user, hh.ENT_CANCELLED)  # unused tokens void, session ends
                     user.plan = "Free"
                     user.subscription_id = None
                     user.billing_cycle = None
@@ -545,8 +589,9 @@ async def sync_subscription(
              user_db.subscription_id = None
              user_db.billing_cycle = None
              final_status = "cancelled"
+             hh.invalidate_entitlement(db, user_db, hh.ENT_CANCELLED)
 
-        if real_status == "active" and is_scheduled_cancel:
+        elif real_status == "active" and is_scheduled_cancel:
             next_date = getattr(dodo_sub, 'next_billing_date', None)
             fmt_date = str(next_date)[:10] if next_date else "soon"
             final_status = f"Scheduled for cancellation on {fmt_date}"
@@ -556,20 +601,13 @@ async def sync_subscription(
         if user_db.subscription_status != final_status:
              user_db.subscription_status = final_status
 
-        found_plan = False
-        for cycle, plans in PLAN_CONFIG.items():
-            for p_name, p_data in plans.items():
-                config_id = str(p_data["id"]).strip()
-                remote_id = str(real_product_id).strip()
-                
-                if config_id == remote_id:
-                    if user_db.plan != p_name:
-                        print(f"UPDATING PLAN: {user_db.plan} -> {p_name}")
-                        user_db.plan = p_name
-                        user_db.billing_cycle = cycle
-                    found_plan = True
-                    break
-            if found_plan: break
+        found = pricing.resolve_by_product_id(db, real_product_id, False)
+        if found:
+            p_name, cycle = found
+            if user_db.plan != p_name:
+                print(f"UPDATING PLAN: {user_db.plan} -> {p_name}")
+                user_db.plan = p_name
+                user_db.billing_cycle = cycle
         
         db.add(user_db)
         db.commit()
@@ -586,6 +624,7 @@ async def sync_subscription(
         print(f"SYNC ERROR: {e}")
         logger.error(f"Sync Failed: {e}")
         if "404" in str(e):
+             hh.invalidate_entitlement(db, user_db, hh.ENT_CANCELLED)
              user_db.subscription_status = "cancelled"
              user_db.subscription_id = None
              db.commit()
@@ -731,6 +770,13 @@ async def verify_google_play_purchase(
             # Save the unique order_id to prevent double-crediting
             current_user.last_payment_id = order_id
             db.commit()
+
+            # Happy Hour: a verified Play SUBSCRIPTION grants this period's tokens (own transaction, after
+            # the purchase is safely recorded). Idempotent on order_id.
+            if is_subscription:
+                _grant_happy_hour(db, current_user, subscription_id=request.purchase_token, grant_ref=order_id,
+                                  cycle=current_user.billing_cycle, expiry=_play_expiry(result),
+                                  source="google_play")
             
             return {
                 "status": "success", 
@@ -777,6 +823,13 @@ async def google_play_rtdn(
             logger.info("Received Google Play renewal notification. Queueing task.")
             # Offload to background so we reply to Google with 200 OK instantly
             background_tasks.add_task(process_renewal, purchase_token, db)
+        elif notification_type in (12, 13):
+            # 12 = SUBSCRIPTION_REVOKED, 13 = SUBSCRIPTION_EXPIRED -> access is over: void Happy Hour tokens.
+            # (3 = CANCELED keeps access until expiry, so the entitlement stays until its expiry date / type 13.)
+            play_user = db.query(User).filter(User.play_purchase_token == purchase_token).first()
+            if play_user:
+                hh.invalidate_entitlement(db, play_user, hh.ENT_CANCELLED)
+                db.commit()
             
         return {"status": "success"} 
 
